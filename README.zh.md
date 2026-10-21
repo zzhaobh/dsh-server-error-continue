@@ -14,15 +14,15 @@ DeepSeek Harness（DSH）插件包：模型请求因服务端或上游临时错�
 
 ## 安装
 
-包是纯 JavaScript，没有构建步骤；从 git 安装不需要 `prepare` 脚本，也不需要 pnpm 构建脚本授权。
-
-从 GitHub 安装进 profile：
+安装或升级到 `main` 最新 commit，只需一行：
 
 ```sh
-dsh plugin --profile <profile> add github:zzhaobh/dsh-server-error-continue
+dsh plugin --profile <profile> add "github:zzhaobh/dsh-server-error-continue#main"
 ```
 
-固定 commit 以便复现：
+再次执行同一命令即可升级：pnpm 会重新解析分支引用，lock 跟到 `main` 最新 commit。包是纯 JavaScript，没有构建步骤，也不需要 `prepare` 脚本或 pnpm 构建脚本授权。
+
+需要可复现时改为固定 commit：
 
 ```sh
 dsh plugin --profile <profile> add "github:zzhaobh/dsh-server-error-continue#<commit>"

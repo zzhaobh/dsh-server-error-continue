@@ -22,15 +22,15 @@ A DeepSeek Harness (DSH) bundle that adds bounded, cancellable recovery for tran
 
 ## Install
 
-The package is plain JavaScript — there is no build step, so a git install needs no `prepare` script and no pnpm build-script allowance.
-
-Install from GitHub into a profile:
+Install or upgrade to the latest commit on `main` with one command:
 
 ```sh
-dsh plugin --profile <profile> add github:zzhaobh/dsh-server-error-continue
+dsh plugin --profile <profile> add "github:zzhaobh/dsh-server-error-continue#main"
 ```
 
-Pin a commit for reproducible installs:
+Re-run the same command to upgrade: pnpm re-resolves the branch ref, so the lock file moves to the newest commit on `main`. The package is plain JavaScript — no `prepare` script and no pnpm build-script allowance are involved.
+
+For a reproducible install, pin a commit instead:
 
 ```sh
 dsh plugin --profile <profile> add "github:zzhaobh/dsh-server-error-continue#<commit>"
