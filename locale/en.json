@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Continue on Server Error",
+    "description": "Adds bounded, cancellable same-request retries, provider-exhaustion escalation, and bounded same-session turn restarts for transient or unclassified model server and upstream errors, while a permanent-failure denylist keeps auth, quota, context, model and policy errors terminal."
+  }
+}

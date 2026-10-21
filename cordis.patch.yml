@@ -1,0 +1,16 @@
+- insert:
+    - id: server-error-continue
+      name: '@zzhaobh/dsh-server-error-continue'
+      config:
+        delayMs: 1000
+        maxDelayMs: 30000
+        maxContinues: 3
+        maxRestarts: 2
+        codes:
+          - SERVER
+        messageIncludes:
+          - server_error
+          - upstream_error
+          - overloaded
+        excludeIncludes: []
+        retryUnclassified: true

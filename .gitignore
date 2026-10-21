@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# dependencies
+node_modules/
+
+# logs and local state
+*.log
+.idea/
+.vscode/
