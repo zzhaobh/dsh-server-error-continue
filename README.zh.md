@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/zzhaobh/dsh-server-error-continue/actions/workflows/ci.yml/badge.svg)](https://github.com/zzhaobh/dsh-server-error-continue/actions/workflows/ci.yml)
 
-DeepSeek Harness（DSH）插件包：模型请求因服务端或上游临时错误失败时，按三层顺序恢复——**同请求重试** → **内置重试耗尽后的升级** → **有界回合重启**。既不会无限重发同一个请求，也不会把认证、额度、上下文超限、模型不存在这类永久错误当成瞬态错误反复重试；对网关侧“加密 reasoning 无法跨账号解密”这类伪 400 也会做有界重试。支持用户停止、卸载取消、指数退避、服务端 `Retry-After`，以及重启提示的撤回与预算复位。
+DeepSeek Harness（DSH）插件包：模型请求因服务端或上游临时错误失败时，按三层顺序恢复——**同请求重试** → **内置重试耗尽后的升级** → **有界回合重启**。既不会无限重发同一个请求，也不会把认证、额度、上下文超限、模型不存在这类永久错误当成瞬态错误反复重试；对网关侧“加密 reasoning 无法跨账号解密”“上游流中途断开（TransferEncodingError / ConnectionResetError）”这类伪 400 也会做有界重试。支持用户停止、卸载取消、指数退避、服务端 `Retry-After`，以及重启提示的撤回与预算复位。
 
 ## 要求
 
@@ -86,7 +86,7 @@ profile 覆盖示例：
 1. **永久事实先排除**（优先于错误码、HTTP 状态和任何重试规则）：终止错误码、认证/权限、额度/计费/余额、上下文超限/413、非法 schema/请求/参数/API key、模型不存在/不支持/无可用通道、内容策略/安全过滤、适配器 `deferred response`/`ended pending`、`excludeIncludes`，以及非瞬态 4xx。408/425/429 例外。
 2. 命中 `codes`（默认 `SERVER`）或 HTTP 5xx → 可恢复。
 3. `PI_AI_ERROR`/`UNKNOWN` 包装码：先匹配 `messageIncludes` 与内置瞬态文本（英文 + 中文），都未命中时按 `retryUnclassified`（默认 `true`）视为瞬态。
-4. **网关 replay 故障 override**：加密 reasoning 无法验证/解密、`previous_response_id ... not found` 等文本先按瞬态处理（`excludeIncludes` 可否决），优先于 400/`INVALID_REQUEST` 的终止判断。
+4. **网关伪 400 override**：加密 reasoning 无法验证/解密、`previous_response_id ... not found`、`上游流中途断开` / `TransferEncodingError` / `ConnectionResetError` / incomplete payload/chunked read 等传输中断文本先按瞬态处理（`excludeIncludes` 可否决），优先于 400/`INVALID_REQUEST` 的终止判断。`Response incomplete: content_filter` 等内容过滤截断仍保持终止。
 5. 同请求重试在 `agent/request-error` waterfall 中后置，其他恢复器（包括 DSH 内置 provider retry）优先。
 6. provider `normal` 策略已管理并耗尽某码时，不再叠加同样的请求，直接进入回合重启阶段；provider `always` 策略保持独占，本插件不介入。
 7. 回合重启通过 `agent.followup()` 排队一条 `source.kind: server-error-continue`（不是 `user`）的显式重启提示；DSH 随即开启新 turn、发新请求。
@@ -102,7 +102,7 @@ profile 覆盖示例：
 
 ## 验证与边界
 
-- 单测：`node --test test/plugin.test.mjs`；当前 45 PASS，完整记录与证据边界见 [VERIFICATION.md](VERIFICATION.md)。
+- 单测：`node --test test/plugin.test.mjs`；当前 47 PASS，完整记录与证据边界见 [VERIFICATION.md](VERIFICATION.md)。
 - CI 在 Node 20/22/24 上运行 `node --check` 与完整测试。
 - 只处理“流内 finish error”；流开始前抛出的异常，以及不经过 agent loop 的直连 LLM 调用（会话标题、压缩摘要等）不在覆盖范围内。
 - “未分类即瞬态”是有界但偏乐观的策略：未知永久错误可能先消耗 `maxContinues` 次重试和最多 `maxRestarts` 次重启才终止；可用 `retryUnclassified: false` 或 `excludeIncludes` 收紧。

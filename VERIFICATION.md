@@ -15,7 +15,7 @@ node --check index.js
 node --test test/plugin.test.mjs
 ```
 
-Current result: **45 passing, 0 failing, 0 skipped, exit 0**.
+Current result: **47 passing, 0 failing, 0 skipped, exit 0**.
 
 Coverage includes:
 
@@ -23,6 +23,7 @@ Coverage includes:
 - unclassified `PI_AI_ERROR`/`UNKNOWN` gateway errors treated as transient by default, and strict allowlist mode with `retryUnclassified: false`;
 - transient HTTP status exceptions 408/425/429 versus other 4xx;
 - gateway encrypted-reasoning replay faults (`encrypted content ... could not be verified/decrypted`, `previous_response_id ... not found`) retried despite an HTTP 400 / `INVALID_REQUEST` classification, with `excludeIncludes` able to veto the override;
+- upstream mid-stream transport breaks (`上游流中途断开`, `TransferEncodingError`, `ConnectionResetError`, incomplete payload/chunked read, "network name no longer available") retried despite HTTP 400 / `INVALID_REQUEST`, while `Response incomplete: content_filter` stays terminal;
 - provider retry policies: `normal` exhaustion escalating straight to a turn restart, `always` policies left untouched, misconfigured permanent codes not restarted;
 - same-request recovery, other recovery owners taking precedence, user stop/unload cancellation, replaced-agent protection, backoff and `Retry-After` handling;
 - turn-restart queuing, per-chain budgets, reset on completed turns and real user input, withdrawal when other input arrives, discarded-slot refunds, pending-input and user-stop suppression, `agent/pre-step` reservation checks, unload withdrawal, and `maxRestarts: 0` compatibility.
@@ -37,6 +38,7 @@ These observations motivated the compatibility work; session identifiers and loc
 - A later `PI_AI_ERROR: Upstream request failed` failure produced only one attempt because the old text allowlist did not match it, which motivated the unclassified-gateway-error fallback.
 - A provider-managed `TRANSPORT` failure exhausted the built-in retry budget and failed the turn in an earlier session, which motivated escalation after provider exhaustion.
 - A subagent session failed with `encrypted content ... could not be verified` while replaying a reasoning item produced earlier by a different upstream account; the same session history succeeded after a later retry, which motivated the replay-fault transient override.
+- A later turn failed with `upstream_error: 上游流中途断开: Response payload is not completed ... TransferEncodingError ... ConnectionResetError`; the adapter classified it as `INVALID_REQUEST` because the text embeds a "400", and the step produced a single attempt before the turn failed. The message is a mid-stream network break, not an invalid request, which motivated the transport-break override. `Response incomplete: content_filter` was also observed and stays permanent.
 
 ## Boundaries not verified
 

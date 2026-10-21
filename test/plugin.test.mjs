@@ -158,6 +158,38 @@ test('gateway encrypted-reasoning replay faults are recoverable despite HTTP 400
   assert.equal(matches({ code: 'INVALID_REQUEST', message: 'invalid request: bad body', status: 400 }), false)
 })
 
+test('upstream mid-stream disconnects are recoverable despite 400/INVALID_REQUEST', () => {
+  const matches = matcher()
+  const failure = {
+    code: 'INVALID_REQUEST',
+    message: "upstream_error: 上游流中途断开: Response payload is not completed: <TransferEncodingError: 400, message='Not enough data to satisfy transfer length header.'>. ConnectionResetError(22, '指定的网络名不再可用。', None, 64, None)",
+  }
+  assert.equal(matches(failure), true)
+  assert.equal(matches({ ...failure, status: 400 }), true)
+  for (const message of [
+    'httpx.RemoteProtocolError: peer closed connection without sending complete message body (incomplete chunked read)',
+    "ConnectionResetError(54, 'Connection reset by peer')",
+    'upstream stream disconnected',
+    'Response payload is not completed',
+  ]) assert.equal(matches({ code: 'INVALID_REQUEST', message }), true, message)
+  const excluded = createMatcher(resolveConfig({ excludeIncludes: ['上游流中途断开'] }))
+  assert.equal(excluded(failure), false)
+  // A content-filter truncated response is permanent, not a transport retry.
+  assert.equal(matches({ code: 'PI_AI_ERROR', message: 'Response incomplete: content_filter' }), false)
+})
+
+test('an upstream mid-stream disconnect retries the same request', async t => {
+  const h = harness(t, { delayMs: 10 })
+  const failure = {
+    code: 'INVALID_REQUEST',
+    message: "upstream_error: 上游流中途断开: Response payload is not completed: <TransferEncodingError: 400, message='Not enough data to satisfy transfer length header.'>",
+  }
+  const result = h.recover({ failure })
+  await h.advance(10)
+  assert.deepEqual(await result, { kind: 'retry' })
+  await h.dispose()
+})
+
 test('an encrypted-reasoning replay failure retries the same request', async t => {
   const h = harness(t, { delayMs: 10 })
   const failure = {

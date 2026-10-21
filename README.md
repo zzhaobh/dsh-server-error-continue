@@ -9,9 +9,10 @@ A DeepSeek Harness (DSH) bundle that adds bounded, cancellable recovery for tran
 - **Same-request retries** — `maxContinues` extra attempts inside the same turn/step, exponential backoff, `Retry-After` support.
 - **Provider-exhaustion escalation** — when a provider's `normal` retry policy has already retried a code and given up, the plugin does not stack more identical requests; it moves straight to a bounded turn restart.
 - **Bounded turn restarts** — a fresh turn (new request) queued through `agent.followup()`, with its own in-step budget, capped per failure chain and withdrawn when real user input arrives or the user stops the turn.
-- **Permanent-failure denylist** — auth/permission, quota/billing, context length, invalid schema/request/API key, model not found/unsupported, content policy, deferred/pending adapter states stay terminal even if they look transient.
+- **Permanent-failure denylist** — auth/permission, quota/billing, context length, invalid schema/request/API key, model not found/unsupported, content policy, content-filter-truncated responses, deferred/pending adapter states stay terminal even if they look transient.
 - **Unclassified gateway errors** — `PI_AI_ERROR` / `UNKNOWN` wrapper codes fall back to a curated transient-text matcher and, by default, treat unclassified messages as transient (bounded). Strict modes are configurable.
 - **Gateway replay faults** — encrypted-reasoning replay rejected with HTTP 400 (cross-account `encrypted_content` decryption failure) is treated as a transient override rather than a permanent invalid request.
+- **Mid-stream transport breaks** — upstream connections cut mid-response (`TransferEncodingError`, `ConnectionResetError`, incomplete payload or chunked read, "network name no longer available") are retried even when a Python gateway reports them as HTTP 400 / `INVALID_REQUEST`, because the client request is valid and the failure is network-transient.
 
 ## Requirements
 
