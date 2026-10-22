@@ -208,7 +208,7 @@ export function hasTransientOverride(message) {
 export function isContentFilterFailure(error) {
   const code = codeOf(error)?.toUpperCase()
   return code === 'CONTENT_FILTER' || code === 'CONTENT_POLICY_VIOLATION'
-    || /\bcontent[_ -](?:filter|policy)\b/i.test(messageOf(error))
+    || /\bcontent[_ -](?:filter|policy)(?=$|[^a-z0-9])/i.test(messageOf(error))
 }
 
 /** Whether a route rejected its own replayed history by item-ID schema. */
