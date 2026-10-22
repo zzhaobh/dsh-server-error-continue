@@ -3,16 +3,16 @@ import assert from 'node:assert/strict'
 import { apply, createMatcher, hasRouteReplayMismatch, isPermanentFailure, resolveConfig, restartPrompt } from '../index.js'
 
 // Exercise our waterfall decisions at the Host boundary, not an LLM/network mock.
-function harness(t, config = {}) {
+function harness(t, config = {}, priorRecovery) {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const listeners = new Map()
   const agents = new Map()
   const cleanups = []
   const logs = []
   const ctx = {
-    on(name, listener) {
+    on(name, listener, options = {}) {
       if (!listeners.has(name)) listeners.set(name, [])
-      listeners.get(name).push(listener)
+      listeners.get(name)[options.prepend ? 'unshift' : 'push'](listener)
       return () => {
         const list = listeners.get(name)
         const index = list?.indexOf(listener) ?? -1
@@ -23,6 +23,7 @@ function harness(t, config = {}) {
     agents: { get: (id) => agents.get(id) },
     logger: Object.fromEntries(['warn', 'info', 'error'].map(level => [level, (...args) => logs.push([level, ...args])])),
   }
+  if (priorRecovery !== undefined) ctx.on('agent/request-error', priorRecovery)
   apply(ctx, config)
   const controller = new AbortController()
   let header
@@ -230,6 +231,17 @@ test('content filtering skips recovery owners, reports why and never fails over'
   const route = await h.waterfall('agent/request', { agent: h.agent }, { provider: 'ds', model: 'gpt-6.1-sol' })
   assert.equal(route.provider, 'ds')
   assert.ok(h.logs.some(row => row.some(value => typeof value === 'string' && value.includes('content_filter: skipping automatic recovery'))))
+  await h.dispose()
+})
+
+test('the content-filter guard runs ahead of a preexisting always-retry owner', async t => {
+  let calls = 0
+  const h = harness(t, {}, async () => { calls++; return { kind: 'retry' } })
+  const payload = { ...h.payload, failure: { code: 'PI_AI_ERROR', message: 'Response incomplete: content_filter' }, retryPolicy: { mode: 'always' } }
+  assert.equal(await h.waterfall('agent/request-error', payload, undefined), undefined)
+  assert.equal(calls, 0)
+  assert.deepEqual(await h.waterfall('agent/request-error', h.payload, undefined), { kind: 'retry' })
+  assert.equal(calls, 1, 'transport errors still delegate to the recovery owner')
   await h.dispose()
 })
 
