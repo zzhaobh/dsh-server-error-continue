@@ -203,6 +203,66 @@ test('upstream mid-stream disconnects are recoverable despite 400/INVALID_REQUES
   assert.equal(matches({ code: 'PI_AI_ERROR', message: 'Response incomplete: content_filter' }), false)
 })
 
+test('content filtering wins over transport and replay overrides', () => {
+  const matches = createMatcher(resolveConfig({ codes: ['SERVER', 'CONTENT_FILTER'] }))
+  for (const failure of [
+    { code: 'PI_AI_ERROR', message: 'Response incomplete: content_filter' },
+    { code: 'SERVER', status: 503, message: 'Connection error. Response incomplete: content_filter' },
+    { code: 'INVALID_REQUEST', message: "Invalid 'input[85].id': 'item_x'. Expected an ID that begins with 'msg'. Response incomplete: content_filter" },
+    { code: 'CONTENT_FILTER', message: 'blocked' },
+  ]) {
+    assert.equal(matches(failure), false, failure.message)
+    assert.equal(hasRouteReplayMismatch(failure), false, failure.message)
+  }
+})
+
+test('content filtering skips recovery owners, reports why and never fails over', async t => {
+  const h = harness(t, { fallbackProvider: 'deepseek-account', fallbackModel: 'deepseek-flash' })
+  h.setHeader('ds', 'gpt-6.1-sol')
+  let delegated = 0
+  const failure = { code: 'PI_AI_ERROR', message: 'Response incomplete: content_filter' }
+  const snapshot = { ...failure }
+  assert.equal(await h.recover({ failure }, async () => { delegated++; return { kind: 'retry' } }), undefined)
+  assert.equal(delegated, 0, 'do not delegate a content block into transport recovery')
+  assert.deepEqual(failure, snapshot, 'preserve the original error rather than pretending success')
+  h.goIdle()
+  assert.equal(h.agent.followups.length, 0)
+  const route = await h.waterfall('agent/request', { agent: h.agent }, { provider: 'ds', model: 'gpt-6.1-sol' })
+  assert.equal(route.provider, 'ds')
+  assert.ok(h.logs.some(row => row.some(value => typeof value === 'string' && value.includes('content_filter: skipping automatic recovery'))))
+  await h.dispose()
+})
+
+test('a content block clears a prior restart intent', async t => {
+  const h = harness(t)
+  const retryPolicy = { mode: 'normal', retryableCodes: ['TRANSPORT'] }
+  await h.recover({ failure: { code: 'TRANSPORT', message: 'Connection error.' }, retryPolicy })
+  await h.recover({ failure: { code: 'PI_AI_ERROR', message: 'Response incomplete: content_filter' } })
+  h.goIdle()
+  assert.equal(h.agent.followups.length, 0, 'an earlier network intent must not wake a filtered turn')
+  await h.dispose()
+})
+
+test('a content block containing replay text cannot activate fallback', async t => {
+  const h = harness(t, { fallbackProvider: 'deepseek-account', fallbackModel: 'deepseek-flash' })
+  h.setHeader('ds', 'gpt-6.1-sol')
+  const failure = { code: 'INVALID_REQUEST', message: "Invalid 'input[85].id': 'item_x'. Expected an ID that begins with 'msg'. Response incomplete: content_filter" }
+  assert.equal(await h.recover({ failure }), undefined)
+  const route = await h.waterfall('agent/request', { agent: h.agent }, { provider: 'ds', model: 'gpt-6.1-sol' })
+  assert.equal(route.provider, 'ds')
+  await h.dispose()
+})
+
+test('the reported missing terminal event remains recoverable in strict mode', async t => {
+  const message = 'OpenAI Responses stream ended before a terminal response event'
+  assert.equal(createMatcher(resolveConfig({ retryUnclassified: false }))({ code: 'PI_AI_ERROR', message }), true)
+  const h = harness(t, { retryUnclassified: false, delayMs: 10 })
+  const result = h.recover({ failure: { code: 'PI_AI_ERROR', message } })
+  await h.advance(10)
+  assert.deepEqual(await result, { kind: 'retry' })
+  await h.dispose()
+})
+
 test('an upstream mid-stream disconnect retries the same request', async t => {
   const h = harness(t, { delayMs: 10 })
   const failure = {
