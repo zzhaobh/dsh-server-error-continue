@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { apply, createMatcher, resolveConfig, restartPrompt } from '../index.js'
+import { apply, createMatcher, hasRouteReplayMismatch, isPermanentFailure, resolveConfig, restartPrompt } from '../index.js'
 
 // Exercise our waterfall decisions at the Host boundary, not an LLM/network mock.
 function harness(t, config = {}) {
@@ -716,6 +716,50 @@ test('the failover is announced once in the conversation', async t => {
   assert.match(first.messages[0].content[0].text, /deepseek-account\/deepseek-flash/)
   const second = await h.waterfall('agent/pre-step', { agent: h.agent, messages: [], signal: h.controller.signal, step: 3 }, { kind: 'next-step', messages: [] })
   assert.equal(second.messages.length, 0)
+  await h.dispose()
+})
+
+test('a route that rejects replayed item IDs fails over immediately instead of retrying', async t => {
+  const h = harness(t, { delayMs: 1, maxContinues: 3, maxRestarts: 3, fallbackProvider: 'deepseek-account', fallbackModel: 'deepseek-flash' })
+  h.setHeader('ds', 'gpt-6.1-sol')
+  const failure = {
+    code: 'INVALID_REQUEST',
+    status: 400,
+    message: 'ds API error (400): {"message":"Invalid \'input[85].id\': \'item_719f2d8c2d876ee643ea60ef\'. Expected an ID that begins with \'msg\'.","type":"invalid_request_error","param":"input[85].id","code":"invalid_value"}',
+  }
+  assert.equal(hasRouteReplayMismatch(failure), true)
+  assert.equal(isPermanentFailure(failure), true, 'without the route switch this is a permanent invalid request')
+  assert.deepEqual(await h.recover({ failure }), { kind: 'retry' })
+  assert.equal(h.agent.followups.length, 0, 'a route switch must not spend a turn restart')
+  const decision = await h.waterfall('agent/request', { agent: h.agent, turn: 1, step: 1, signal: h.controller.signal }, { provider: 'ds', model: 'gpt-6.1-sol' })
+  assert.equal(decision.provider, 'deepseek-account')
+  assert.equal(decision.model, 'deepseek-flash')
+  // Once the failover is active, the same rejection on the emergency route is terminal.
+  h.setHeader('deepseek-account', 'deepseek-flash')
+  assert.equal(await h.recover({ failure }), undefined)
+  await h.dispose()
+})
+
+test('a replay mismatch without a failover route stays a permanent failure', async t => {
+  const h = harness(t)
+  const failure = {
+    code: 'INVALID_REQUEST',
+    status: 400,
+    message: "ds API error (400): {\"message\":\"Invalid 'input[85].id': 'item_x'. Expected an ID that begins with 'msg'.\"}",
+  }
+  assert.equal(await h.recover({ failure }), undefined)
+  assert.equal(h.agent.followups.length, 0)
+  await h.dispose()
+})
+
+test('the replay-mismatch notice explains why the route changed', async t => {
+  const h = harness(t, { delayMs: 1, maxContinues: 3, maxRestarts: 3, fallbackProvider: 'deepseek-account', fallbackModel: 'deepseek-flash' })
+  h.setHeader('ds', 'gpt-6.1-sol')
+  const failure = { code: 'INVALID_REQUEST', status: 400, message: "Invalid 'input[85].id': 'item_x'. Expected an ID that begins with 'msg'." }
+  assert.deepEqual(await h.recover({ failure }), { kind: 'retry' })
+  const decision = await h.waterfall('agent/pre-step', { agent: h.agent, messages: [], signal: h.controller.signal, step: 2 }, { kind: 'next-step', messages: [] })
+  assert.equal(decision.messages.length, 1)
+  assert.match(decision.messages[0].content[0].text, /rejected its replayed history/)
   await h.dispose()
 })
 

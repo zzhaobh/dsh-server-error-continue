@@ -114,6 +114,14 @@ const TRANSIENT_OVERRIDE_TEXT = Object.freeze([
   /broken pipe/,
   /server disconnected/,
 ])
+// OpenAI Responses replay rejects provider-specific item IDs when a route no
+// longer accepts its own stored history (for example `item_...` where a message
+// ID must begin with `msg`). Retrying the same history on the same route cannot
+// succeed; switching routes is the only safe recovery.
+const ROUTE_REPLAY_MISMATCH_TEXT = Object.freeze([
+  /invalid 'input\[\d+\]\.id'/i,
+  /expected an id that begins with 'msg'/i,
+])
 // Transient wording used as the allowlist when `retryUnclassified` is off.
 const TRANSIENT_TEXT = Object.freeze([
   /server_error/,
@@ -194,6 +202,12 @@ export function statusOf(error) {
 /** Whether the text names a gateway-side replay/account-affinity fault. */
 export function hasTransientOverride(message) {
   return TRANSIENT_OVERRIDE_TEXT.some(pattern => pattern.test(message))
+}
+
+/** Whether a route rejected its own replayed history by item-ID schema. */
+export function hasRouteReplayMismatch(error) {
+  const message = messageOf(error)
+  return ROUTE_REPLAY_MISMATCH_TEXT.some(pattern => pattern.test(message))
 }
 
 /** Whether one failure is a permanent fact no retry rule may override. */
@@ -355,10 +369,13 @@ function routeLabel(route) {
 function failoverNotice(state) {
   const from = routeLabel(state.original)
   const to = routeLabel(state)
+  const why = state.reason === 'replay-mismatch'
+    ? 'the previous route rejected its replayed history'
+    : 'repeated connection failures'
   return {
     id: randomUUID(),
     role: 'user',
-    content: [{ type: 'text', text: `[model changed: ${from} → ${to} (automatic failover after repeated connection failures)]` }],
+    content: [{ type: 'text', text: `[model changed: ${from} → ${to} (automatic failover: ${why})]` }],
     source: { kind: 'model-selection', form: 'notice', summary: `${from} → ${to}` },
   }
 }
@@ -486,7 +503,7 @@ export function apply(ctx, rawConfig = {}) {
    * onto the emergency route. The request header then keeps that route for the
    * session unless the user explicitly selects another model.
    */
-  function beginFailover(agent, failure) {
+  function beginFailover(agent, failure, reason = 'exhausted') {
     if (config.fallbackProvider === undefined || config.fallbackModel === undefined) return false
     if (failovers.has(agent)) return false
     if (ctx.agents.get(agent.id) !== agent) return false
@@ -499,13 +516,13 @@ export function apply(ctx, rawConfig = {}) {
       // A missing header only means the notice cannot name the previous route.
     }
     if (original?.provider === fallback.provider && original.model === fallback.model) return false
-    failovers.set(agent, { ...fallback, original, notified: false, failureCode: codeOf(failure) ?? 'UNKNOWN' })
+    failovers.set(agent, { ...fallback, original, notified: false, reason, failureCode: codeOf(failure) ?? 'UNKNOWN' })
     attempts.delete(agent)
     const state = chainOf(agent)
     state.intent = undefined
     state.restarts = 0
     state.pending = undefined
-    ctx.logger.warn('[server-error-continue] agent %s exhausted retries and turn restarts; failing over to %s/%s', agent.id, fallback.provider, fallback.model)
+    ctx.logger.warn('[server-error-continue] agent %s %s; failing over to %s/%s', agent.id, reason === 'replay-mismatch' ? 'route rejected the replayed history' : 'exhausted retries and turn restarts', fallback.provider, fallback.model)
     return true
   }
 
@@ -523,6 +540,13 @@ export function apply(ctx, rawConfig = {}) {
     const { agent, turn, step, signal, failure, retryPolicy } = payload
     const fused = AbortSignal.any([signal, lifetime.signal])
     if (fused.aborted || ctx.agents.get(agent.id) !== agent) return
+    // A route that rejects its own replayed item IDs cannot recover by retrying
+    // the same history; switch routes before the permanent-failure rules apply.
+    if (hasRouteReplayMismatch(failure)) {
+      if (beginFailover(agent, failure, 'replay-mismatch')) return { kind: 'retry' }
+      ctx.logger.warn('[server-error-continue] agent %s route rejected its replayed history and no failover route is available', agent.id)
+      return
+    }
     // A provider "always" policy owns recovery forever; never race it with restarts.
     if (retryPolicy?.mode === 'always') return
     // A normal provider policy already spent its own retries on this code; escalate instead

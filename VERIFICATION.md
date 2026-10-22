@@ -15,7 +15,7 @@ node --check index.js
 node --test test/plugin.test.mjs
 ```
 
-Current result: **57 passing, 0 failing, 0 skipped, exit 0**.
+Current result: **60 passing, 0 failing, 0 skipped, exit 0**.
 
 Coverage includes:
 
@@ -28,7 +28,8 @@ Coverage includes:
 - provider retry policies: `normal` exhaustion escalating straight to a turn restart, `always` policies left untouched, misconfigured permanent codes not restarted;
 - same-request recovery, other recovery owners taking precedence, user stop/unload cancellation, replaced-agent protection, backoff and `Retry-After` handling;
 - turn-restart queuing from the idle transition (not during the failing turn), per-chain budgets, reset on completed turns and real user input, withdrawal when other input arrives, discarded-slot refunds, pending-user/pending-goal precedence, pending automatic notices not blocking a restart, user-stop suppression, `agent/pre-step` reservation checks, unload withdrawal, and `maxRestarts: 0` compatibility;
-- emergency failover after both in-step retries and turn restarts are spent: one retry is routed to `fallbackProvider`/`fallbackModel`, the request-header hand-off stops forcing the route once normal selection catches up, an explicit `model/selection` event clears it, the conversation notice is emitted once, and no failover occurs when the route is unconfigured.
+- emergency failover after both in-step retries and turn restarts are spent: one retry is routed to `fallbackProvider`/`fallbackModel`, the request-header hand-off stops forcing the route once normal selection catches up, an explicit `model/selection` event clears it, the conversation notice is emitted once, and no failover occurs when the route is unconfigured;
+- a route replay-schema rejection (`Invalid 'input[85].id' ... Expected an ID that begins with 'msg'`) switches routes immediately without spending a turn restart, is terminal on the emergency route, stays permanent without a configured route, and explains the switch in the conversation notice.
 
 The suite is hermetic: it uses Node's mock timers and fake Agent/Cordis boundaries, makes no paid model requests, no SSH connections, and no network calls.
 
@@ -43,6 +44,7 @@ These observations motivated the compatibility work; session identifiers and loc
 - A later turn failed with `upstream_error: 上游流中途断开: Response payload is not completed ... TransferEncodingError ... ConnectionResetError`; the adapter classified it as `INVALID_REQUEST` because the text embeds a "400", and the step produced a single attempt before the turn failed. The message is a mid-stream network break, not an invalid request, which motivated the transport-break override. `Response incomplete: content_filter` was also observed and stays permanent.
 - Two long goal-driven turns exhausted the built-in provider budget on `TRANSPORT` `Connection error.` (five retries each) and then failed the turn without a restart prompt. Code inspection showed why: the agent-loop turn-error path throws out of the driver, so a `followup()` queued during the failing turn never wakes the agent, and the previous pending-input guard also skipped when an automatic notice was queued. 2.3.0 records a restart intent and queues it from the idle transition instead; pending user prompts and goal rounds still take precedence. 2.3.1 additionally keeps standard transport codes recoverable without a provider policy and recognizes `Connection error.` wording. Both behaviors are covered by unit tests but were not re-verified against a live outage after the change.
 - 2.4.0 adds opt-in emergency failover to `deepseek-account/deepseek-flash` after the restart allowance is spent. It is covered by unit tests for routing, header catch-up, explicit-selection clearing and notice generation, but has not been exercised against a real multi-provider outage; the fallback account must be signed in.
+- A later turn on `ds/gpt-6.1-sol` failed with `ds API error (400): Invalid 'input[85].id': 'item_719f...'. Expected an ID that begins with 'msg'` (`INVALID_REQUEST`). The rejected item belongs to the same provider's stored assistant replay state, so the provider no longer accepts its own history; retrying the same route cannot work. 2.4.1 treats this replay-schema rejection as an immediate route failover instead of a terminal request. The underlying adapter/history mismatch is not repaired, and the emergency route accepting the foreign history has not been live-verified.
 
 ## Boundaries not verified
 

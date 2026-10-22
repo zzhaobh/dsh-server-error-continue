@@ -96,6 +96,7 @@ profile 覆盖示例：
 6. provider `normal` 策略已管理并耗尽某码时，不再叠加同样的请求，直接进入回合重启阶段；provider `always` 策略保持独占，本插件不介入。
 7. 回合重启**不在失败回合内排队**：错误路径会让 driver 直接退出，回合内 followup 不会唤醒 agent。插件先记录 restart intent，等 agent 进入 idle 后再用 `agent.followup()` 排队 `source.kind: server-error-continue`（不是 `user`）的显式重启提示，从而真正唤醒新 turn、发新请求。
 8. **应急模型切换**：如果重启预算也耗尽，下一请求通过 `agent/request` waterfall 改写到 `fallbackProvider`/`fallbackModel`。请求头持久记录应急路由，后续请求无需每次强制改写；用户显式选择模型（`model/selection`）会立即结束应急状态。永久错误不会触发切换；两个字段都未配置时该功能关闭。
+9. **路由 replay 不兼容**：provider 拒收自己回放的历史 item ID（如 `Invalid 'input[85].id': 'item_...'. Expected an ID that begins with 'msg'`）时，同一条历史在同一路由上重试不可能成功，因此跳过重试/重启预算，立即切到应急路由并重试一次。
 
 ## 重启链的生命周期
 
@@ -109,13 +110,14 @@ profile 覆盖示例：
 
 ## 验证与边界
 
-- 单测：`node --test test/plugin.test.mjs`；当前 57 PASS，完整记录与证据边界见 [VERIFICATION.md](VERIFICATION.md)。
+- 单测：`node --test test/plugin.test.mjs`；当前 60 PASS，完整记录与证据边界见 [VERIFICATION.md](VERIFICATION.md)。
 - CI 在 Node 20/22/24 上运行 `node --check` 与完整测试。
 - 只处理“流内 finish error”；流开始前抛出的异常，以及不经过 agent loop 的直连 LLM 调用（会话标题、压缩摘要等）不在覆盖范围内。
 - “未分类即瞬态”是有界但偏乐观的策略：未知永久错误可能先消耗 `maxContinues` 次重试和最多 `maxRestarts` 次重启才终止；可用 `retryUnclassified: false` 或 `excludeIncludes` 收紧。
 - 重启提示会作为会话消息进入历史（与 goal round 机制相同），但不冒充用户发言。
 - 恢复预算只存在于当前进程与失败链上，不跨插件重载或 DSH 重启持久化。
 - 应急切换只改路由，不能让失效凭证变有效：`deepseek-account` 必须已登录（或换用其他已配置 provider）；跨 provider 切换会把 provider 私有 replay 状态降级为通用历史。
+- item ID 拒收属于 provider/adapter 的回放兼容问题，不是本插件能修复的存储历史；应急切换只是绕过该路由，应急路由必须能接受这条外来历史才有效。
 - 不对所有 provider/网关错误类声明真实端到端验证；详见 [VERIFICATION.md](VERIFICATION.md)。
 
 ## 开发
