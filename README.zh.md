@@ -98,6 +98,18 @@ profile 覆盖示例：
 8. **应急模型切换**：如果重启预算也耗尽，下一请求通过 `agent/request` waterfall 改写到 `fallbackProvider`/`fallbackModel`。请求头持久记录应急路由，后续请求无需每次强制改写；用户显式选择模型（`model/selection`）会立即结束应急状态。永久错误不会触发切换；两个字段都未配置时该功能关闭。
 9. **路由 replay 不兼容**：provider 拒收自己回放的历史 item ID（如 `Invalid 'input[85].id': 'item_...'. Expected an ID that begins with 'msg'`）时，同一条历史在同一路由上重试不可能成功，因此跳过重试/重启预算，立即切到应急路由并重试一次。
 
+## 内容过滤与工具错误的兼容
+
+`Response incomplete: content_filter`、`CONTENT_FILTER`、`content_policy_violation` 按“跳过自动恢复”处理，不是网络瞬态错误：
+
+- 前置拦截其他重试处理器，清除旧的重启/切换意图，记录 `content_filter: skipping automatic recovery` 原因。
+- 不重试、不重启回合、不切换模型绕过过滤；即使同时出现连接断开或 replay item ID 文本也不恢复。
+- 保留原始失败，DSH 仍将该回合标为失败；不伪装成完成，不自动继续被过滤的任务。失败响应中的工具调用不会被 agent loop 执行。用户需检查任务，再提交允许的新任务。
+- `OpenAI Responses stream ended before a terminal response event` 则仍是可重试的断流文本，严格模式下也识别。
+- `invalid justification: expected a non-empty sentence` 属于文件工具参数校验，不是 LLM 断流；应修正工具参数，不重发模型请求来掩盖工具失败。
+
+安装/更新插件涉及依赖变更：先 `Cmd+Q` 完全退出桌面应用，运行安装指令后再打开，避免运行中 profile reload 的根 Include 问题。插件显示的安装版本不证明运行中的实例已重载。
+
 ## 重启链的生命周期
 
 - 计数绑定 Agent 上的失败链：成功回合（`turn/end` 原因不是 `error`）、真实用户输入、插件卸载都会结束链并归零。
@@ -110,7 +122,7 @@ profile 覆盖示例：
 
 ## 验证与边界
 
-- 单测：`node --test test/plugin.test.mjs`；当前 60 PASS，完整记录与证据边界见 [VERIFICATION.md](VERIFICATION.md)。
+- 单测：`node --test test/plugin.test.mjs`；当前 66 PASS，完整记录与证据边界见 [VERIFICATION.md](VERIFICATION.md)。
 - CI 在 Node 20/22/24 上运行 `node --check` 与完整测试。
 - 只处理“流内 finish error”；流开始前抛出的异常，以及不经过 agent loop 的直连 LLM 调用（会话标题、压缩摘要等）不在覆盖范围内。
 - “未分类即瞬态”是有界但偏乐观的策略：未知永久错误可能先消耗 `maxContinues` 次重试和最多 `maxRestarts` 次重启才终止；可用 `retryUnclassified: false` 或 `excludeIncludes` 收紧。

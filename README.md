@@ -105,6 +105,14 @@ Example profile override:
 
 A restart chain is bounded per agent: it resets on a non-error turn end, on real user input, or on unload. Queued restarts are withdrawn when user or other automatic input arrives, and `agent/pre-step` rejects a restart whose reservation went stale. Unloading drains in-flight waits and withdraws queued restart prompts.
 
+## Content-filter and tool-error handling
+
+`Response incomplete: content_filter`, `CONTENT_FILTER`, and `content_policy_violation` mean **skip automatic recovery**, not a transient network outage. The prepended guard vetoes nested retry owners, clears stale restart/failover intent and logs `content_filter: skipping automatic recovery`. It does not retry, restart or switch providers to evade filtering, even when transport/replay text is also present. The original failure is retained: DSH still marks the turn failed, not successfully completed. The agent loop does not execute tool calls from a failed response. Review the task before submitting an allowed new task.
+
+`OpenAI Responses stream ended before a terminal response event` remains a recoverable transport message in strict mode. `invalid justification: expected a non-empty sentence` is file-tool argument validation, not a model-request error; correct the tool arguments instead.
+
+For Desktop dependency upgrades, quit the app completely before running the install command, then reopen it. Installing a version does not prove that the running Host instance has reloaded it.
+
 ## Verification and known limits
 
 - Unit tests: `node --test test/plugin.test.mjs` — see [VERIFICATION.md](VERIFICATION.md) for the current pass counts and evidence boundaries.

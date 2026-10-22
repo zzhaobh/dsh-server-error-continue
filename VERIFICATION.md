@@ -15,7 +15,27 @@ node --check index.js
 node --test test/plugin.test.mjs
 ```
 
-Current result: **60 passing, 0 failing, 0 skipped, exit 0**.
+Current result: **66 passing, 0 failing, 0 skipped, exit 0**. Node coverage: lines **95.27%**, branches **85.44%**, functions **95.31%**.
+
+### 2.4.2 TDD evidence: skip content-filter recovery
+
+Journeys were derived from the user's error report, not a plan file. Goal: explicitly classify filtered responses without retry/provider-switch evasion, preserve the original failure, and keep transport errors recoverable.
+
+- RED: `node --test test/plugin.test.mjs` executed 65 tests; 61 passed and 4 failed on mixed filter/transport classification, retry-owner delegation, stale restart intent, and mixed filter/replay failover. Checkpoint `5019272`.
+- Ordering RED: a preexisting always-retry-owner test failed until the guard was prepended. Checkpoint `4be18e9`.
+- GREEN: `node --check index.js && node --test --experimental-test-coverage test/plugin.test.mjs` executed 66 tests, all passed. Checkpoint `6f2853c`.
+- Review identified a text-only `content_policy_violation` suffix gap; reproducer RED checkpoint `e488465`, fix GREEN `5216ac8`.
+- Real installed Cordis check: ACTIVE plugin mount, prepended guard vetoed a preexisting retry callback; original failure unchanged; transport delegation still worked; disposal completed, exit 0. The initial logger assertion failed because the local exporter did not enable WARN level; the corrected exporter captured the diagnostic. No live model request was made.
+
+| Guarantee | Test type | Result |
+|---|---|---|
+| Filter code/text wins over transport/replay hints | unit | PASS |
+| Filter skips retry owners, restart and fallback; preserves failure | mocked Host boundary | PASS |
+| Filter clears stale restart intent | mocked Host boundary | PASS |
+| Prepended filter guard precedes retry owner | unit + installed Cordis | PASS |
+| Missing terminal response event still retries in strict mode | mocked Host boundary | PASS |
+
+No claim that filtering turns into successful completion or that a real filtered task was automatically resumed. Unit tests cover plugin decisions; installed agent-loop source confirms failed responses do not execute tools. A later plugin prepended ahead of this guard could change listener ownership; the actual configured installation order must remain part of runtime verification.
 
 Coverage includes:
 
