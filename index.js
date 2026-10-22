@@ -28,6 +28,9 @@ const DEFAULTS = Object.freeze({
   messageIncludes: Object.freeze(['server_error', 'upstream_error', 'overloaded']),
   excludeIncludes: Object.freeze([]),
   retryUnclassified: true,
+  // Optional emergency route. Both must be set together; disabled by default.
+  fallbackProvider: undefined,
+  fallbackModel: undefined,
 })
 const TERMINAL_CODES = new Set([
   'AUTH', 'QUOTA', 'INVALID_REQUEST', 'CONTEXT_WINDOW_EXCEEDED',
@@ -269,8 +272,13 @@ export function resolveConfig(raw = {}) {
     messageIncludes: requireStringList(raw.messageIncludes ?? [...DEFAULTS.messageIncludes], 'messageIncludes'),
     excludeIncludes: requireStringList(raw.excludeIncludes ?? [...DEFAULTS.excludeIncludes], 'excludeIncludes'),
     retryUnclassified: requireBoolean(raw.retryUnclassified ?? DEFAULTS.retryUnclassified, 'retryUnclassified'),
+    fallbackProvider: raw.fallbackProvider === undefined ? undefined : requireString(raw.fallbackProvider, 'fallbackProvider'),
+    fallbackModel: raw.fallbackModel === undefined ? undefined : requireString(raw.fallbackModel, 'fallbackModel'),
   }
   if (config.maxDelayMs < config.delayMs) throw new Error('server-error-continue: maxDelayMs must be >= delayMs')
+  if ((config.fallbackProvider === undefined) !== (config.fallbackModel === undefined)) {
+    throw new Error('server-error-continue: fallbackProvider and fallbackModel must be set together')
+  }
   return config
 }
 
@@ -341,6 +349,20 @@ function wait(delayMs, signal) {
   })
 }
 
+function routeLabel(route) {
+  return route === undefined ? 'the previous route' : `${route.provider}/${route.model}`
+}
+function failoverNotice(state) {
+  const from = routeLabel(state.original)
+  const to = routeLabel(state)
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text: `[model changed: ${from} → ${to} (automatic failover after repeated connection failures)]` }],
+    source: { kind: 'model-selection', form: 'notice', summary: `${from} → ${to}` },
+  }
+}
+
 export function apply(ctx, rawConfig = {}) {
   const config = resolveConfig(rawConfig)
   const matches = createMatcher(config)
@@ -349,6 +371,9 @@ export function apply(ctx, rawConfig = {}) {
   const attempts = new WeakMap()
   // One bounded restart chain per Agent: extra turns, not extra identical requests.
   const chains = new WeakMap()
+  // Emergency route per Agent, kept outside the restart chain so it survives a
+  // successful turn; it is cleared by a real model selection or Agent disposal.
+  const failovers = new WeakMap()
   const active = new Set()
   const queuedRestarts = new Set()
   if (rawConfig?.prompt !== undefined) {
@@ -370,6 +395,7 @@ export function apply(ctx, rawConfig = {}) {
   /** Forget one Agent's chain without touching its durable inbox. */
   function forget(agent) {
     chains.delete(agent)
+    failovers.delete(agent)
     queuedRestarts.delete(agent)
   }
   /** Withdraw one queued restart prompt and optionally refund its budget slot. */
@@ -449,6 +475,40 @@ export function apply(ctx, rawConfig = {}) {
     return true
   }
 
+  /** Whether this Agent has spent its turn-restart allowance. */
+  function restartExhausted(agent) {
+    const state = chainOf(agent)
+    return config.maxRestarts === 0 || state.restarts >= config.maxRestarts
+  }
+
+  /**
+   * After every same-request retry and turn restart is spent, force one request
+   * onto the emergency route. The request header then keeps that route for the
+   * session unless the user explicitly selects another model.
+   */
+  function beginFailover(agent, failure) {
+    if (config.fallbackProvider === undefined || config.fallbackModel === undefined) return false
+    if (failovers.has(agent)) return false
+    if (ctx.agents.get(agent.id) !== agent) return false
+    const fallback = { provider: config.fallbackProvider, model: config.fallbackModel }
+    let original
+    try {
+      const header = agent.session?.requestHeader?.()?.config
+      if (header !== undefined) original = { provider: header.provider, model: header.model }
+    } catch {
+      // A missing header only means the notice cannot name the previous route.
+    }
+    if (original?.provider === fallback.provider && original.model === fallback.model) return false
+    failovers.set(agent, { ...fallback, original, notified: false, failureCode: codeOf(failure) ?? 'UNKNOWN' })
+    attempts.delete(agent)
+    const state = chainOf(agent)
+    state.intent = undefined
+    state.restarts = 0
+    state.pending = undefined
+    ctx.logger.warn('[server-error-continue] agent %s exhausted retries and turn restarts; failing over to %s/%s', agent.id, fallback.provider, fallback.model)
+    return true
+  }
+
   /** Whether the built-in provider retry already owns (and spent) this code's budget. */
   function providerExhausted(failure, retryPolicy) {
     return retryPolicy?.mode === 'normal'
@@ -472,6 +532,11 @@ export function apply(ctx, rawConfig = {}) {
         ctx.logger.warn('[server-error-continue] agent %s provider-managed %s stayed terminal; not restarting', agent.id, codeOf(failure) ?? 'UNKNOWN')
         return
       }
+      if (restartExhausted(agent)) {
+        if (beginFailover(agent, failure)) return { kind: 'retry' }
+        ctx.logger.warn('[server-error-continue] agent %s exhausted retries and turn restarts; leaving the failure terminal', agent.id)
+        return
+      }
       ctx.logger.warn('[server-error-continue] agent %s escalating %s to a turn restart after provider retries', agent.id, codeOf(failure) ?? 'UNKNOWN')
       requestRestart(agent, failure, fused, 0)
       return
@@ -485,6 +550,11 @@ export function apply(ctx, rawConfig = {}) {
     if (config.maxContinues > 0 && state.used >= config.maxContinues) {
       ctx.logger.warn('[server-error-continue] agent %s stopped after %d extra request retries', agent.id, state.used)
       // Escalate to a bounded new turn instead of repeating the same request forever.
+      if (restartExhausted(agent)) {
+        if (beginFailover(agent, failure)) return { kind: 'retry' }
+        ctx.logger.warn('[server-error-continue] agent %s exhausted retries and turn restarts; leaving the failure terminal', agent.id)
+        return
+      }
       requestRestart(agent, failure, fused, state.used)
       return
     }
@@ -536,14 +606,42 @@ export function apply(ctx, rawConfig = {}) {
       state.restarts = 0
     }
   })
-  // Any turn that does not end in an error closes the restart chain.
+  // Any turn that does not end in an error closes the restart chain. An explicit
+  // model selection always ends an automatic failover, even while the old request
+  // header still records the emergency route.
   const disposeTurnEnd = ctx.on('session/event', (session, event) => {
-    if (event?.type !== 'turn/end') return
     const agent = ctx.agents.get(session?.id)
     if (agent === undefined) return
+    if (event?.type === 'model/selection') {
+      if (failovers.delete(agent)) ctx.logger.warn('[server-error-continue] agent %s model selection cleared the automatic failover', agent.id)
+      return
+    }
+    if (event?.type !== 'turn/end') return
     if (event.data?.reason?.kind === 'error') return
     resetChain(agent)
   })
+  // Force the emergency route until the session's normal selection catches up
+  // with the newly logged request header; the selection listener above remains
+  // the authority when the user picks a model explicitly.
+  const disposeRequestRoute = ctx.on('agent/request', async ({ agent }, next) => {
+    const decision = await next()
+    const state = failovers.get(agent)
+    if (state === undefined) return decision
+    if (decision.provider === state.provider && decision.model === state.model) {
+      failovers.delete(agent)
+      return decision
+    }
+    return { ...decision, provider: state.provider, model: state.model }
+  }, { prepend: true })
+  // Tell the model and the user that this turn now runs on the emergency route.
+  const disposeFailoverNotice = ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+    const decision = await next()
+    if (decision.kind === 'reject' || signal.aborted) return decision
+    const state = failovers.get(agent)
+    if (state === undefined || state.notified) return decision
+    state.notified = true
+    return { ...decision, messages: [...decision.messages, failoverNotice(state)] }
+  }, { prepend: true })
   // Fail closed if a restart prompt outlives its reservation (unload, reset, replay).
   const disposePreStep = ctx.on('agent/pre-step', async ({ agent, messages, signal }, next) => {
     const submitted = messages.find(isRestartMessage)
@@ -587,7 +685,7 @@ export function apply(ctx, rawConfig = {}) {
     forget(agent)
   })
   ctx.effect(() => async () => {
-    for (const dispose of [disposeListener, disposeClaimed, disposeDiscarded, disposeInserted, disposeTurnEnd, disposePreStep, disposeStatus, disposeAgent]) dispose()
+    for (const dispose of [disposeListener, disposeClaimed, disposeDiscarded, disposeInserted, disposeTurnEnd, disposePreStep, disposeStatus, disposeRequestRoute, disposeFailoverNotice, disposeAgent]) dispose()
     for (const agent of [...queuedRestarts]) {
       const state = chains.get(agent)
       if (state !== undefined) dropPending(agent, state, false)

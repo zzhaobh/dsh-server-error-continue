@@ -4,7 +4,7 @@ English | [中文](README.zh.md)
 
 [![CI](https://github.com/zzhaobh/dsh-server-error-continue/actions/workflows/ci.yml/badge.svg)](https://github.com/zzhaobh/dsh-server-error-continue/actions/workflows/ci.yml)
 
-A DeepSeek Harness (DSH) bundle that adds bounded, cancellable recovery for transient model-request failures. It retries the failed request in place, escalates after a provider's own retry budget is spent, and finally restarts the turn a bounded number of times — without fabricating user messages or retrying permanent failures such as authentication, quota, context overflow, or unknown models.
+A DeepSeek Harness (DSH) bundle that adds bounded, cancellable recovery for transient model-request failures. It retries the failed request in place, escalates after a provider's own retry budget is spent, restarts the turn a bounded number of times, and — when that is still not enough — can fail over the next request to a configured emergency route such as `deepseek-account/deepseek-flash`, without fabricating user messages or retrying permanent failures such as authentication, quota, context overflow, or unknown models.
 
 - **Same-request retries** — `maxContinues` extra attempts inside the same turn/step, exponential backoff, `Retry-After` support.
 - **Provider-exhaustion escalation** — when a provider's `normal` retry policy has already retried a code and given up, the plugin does not stack more identical requests; it moves straight to a bounded turn restart.
@@ -14,6 +14,7 @@ A DeepSeek Harness (DSH) bundle that adds bounded, cancellable recovery for tran
 - **Gateway replay faults** — encrypted-reasoning replay rejected with HTTP 400 (cross-account `encrypted_content` decryption failure) is treated as a transient override rather than a permanent invalid request.
 - **Mid-stream transport breaks** — upstream connections cut mid-response (`TransferEncodingError`, `ConnectionResetError`, incomplete payload or chunked read, "network name no longer available") are retried even when a Python gateway reports them as HTTP 400 / `INVALID_REQUEST`, because the client request is valid and the failure is network-transient.
 - **Transport codes without a provider policy** — `SERVER`, `TIMEOUT`, `TRANSPORT`, `RATE_LIMIT`, and `EMPTY_RESPONSE` remain recoverable even if a provider supplies no retry policy, and connection wording such as `Connection error.` is recognized in both normal and strict modes.
+- **Emergency model failover (opt-in)** — after in-step retries and turn restarts are both exhausted, the plugin sends one request to `fallbackProvider`/`fallbackModel` (for example `deepseek-account` / `deepseek-flash`). The new route is written into the durable request header, announced in the conversation as a `model-selection` notice, and stopped as soon as the user explicitly selects a model.
 
 ## Requirements
 
@@ -68,6 +69,8 @@ Defaults ship in the bundle's [`cordis.patch.yml`](cordis.patch.yml). A profile 
 | `messageIncludes` | `["server_error", "upstream_error", "overloaded"]` | Extra case-insensitive transient substrings for wrapper codes. |
 | `excludeIncludes` | `[]` | Site-specific permanent substrings; a match vetoes both text fallback and the built-in replay override. |
 | `retryUnclassified` | `true` | Whether wrapper codes with no matching permanent/transient text are treated as transient. `false` switches to strict allowlist mode. |
+| `fallbackProvider` | unset | Emergency provider route, used only after all retries and turn restarts are spent. Must be set together with `fallbackModel`. |
+| `fallbackModel` | unset | Emergency model, for example `deepseek-flash`. |
 | `prompt` | `continue` | Legacy v1 key, accepted for compatibility but never sent; configuring it logs a deprecation warning. |
 
 Example profile override:
@@ -88,6 +91,8 @@ Example profile override:
       - overloaded
     excludeIncludes: []
     retryUnclassified: true
+    fallbackProvider: deepseek-account
+    fallbackModel: deepseek-flash
 ```
 
 ## How recovery works
@@ -96,6 +101,7 @@ Example profile override:
 2. **Same-request retry.** A match schedules a retry of the same request inside the same step with exponential backoff. Other recovery owners (including DSH's built-in provider retry) get precedence through the request-error waterfall.
 3. **Provider-exhaustion escalation.** If the provider's `normal` retry policy already managed the failing code, the plugin skips further identical requests and schedules a turn restart directly. Provider `always` policies keep ownership; the plugin never races them.
 4. **Bounded turn restart.** The plugin records a restart intent on the exhausted failure and queues the restart prompt when the agent transitions to idle — the turn-error path leaves the driver before it can consume inbox input, so queueing during the failing turn would never wake it. `agent.followup()` from idle starts a new turn with a new model request; the prompt's `source.kind` is `server-error-continue` (not `user`) and it is visible in history as an explicit automatic-restart record. A pending user prompt or goal round takes precedence; pending automatic notices (subagent results, schedule reminders) travel with the restarted turn instead of blocking it.
+5. **Emergency model failover.** When the restart allowance is also spent, the next request is routed to `fallbackProvider`/`fallbackModel` through the `agent/request` waterfall. The durable request header then records the emergency route, so later requests use it without a per-request override; an explicit `model/selection` event clears the failover. Permanent failures never trigger failover, and the feature is disabled unless both keys are configured.
 
 A restart chain is bounded per agent: it resets on a non-error turn end, on real user input, or on unload. Queued restarts are withdrawn when user or other automatic input arrives, and `agent/pre-step` rejects a restart whose reservation went stale. Unloading drains in-flight waits and withdraws queued restart prompts.
 
@@ -105,6 +111,7 @@ A restart chain is bounded per agent: it resets on a non-error turn end, on real
 - CI runs `node --check` and the full suite on Node 20, 22, and 24.
 - Only in-band model-stream finish errors reach the plugin; errors thrown before a stream starts, and direct LLM calls outside the agent loop (session titles, compaction summaries), are not covered.
 - "Unclassified is transient" is bounded but optimistic: an unknown permanent error may consume `maxContinues` retries and up to `maxRestarts` restarts before surfacing. Use `retryUnclassified: false` or `excludeIncludes` to tighten.
+- Failover only changes the model route; it cannot make an unavailable credential valid. `deepseek-account` must be signed in (or use another configured provider), and switching routes degrades provider-specific replay state to provider-neutral history. The failover route is process-local and is not persisted across an Agent restart.
 - Restart prompts are visible session messages (same mechanism as goal rounds), not user speech.
 - Recovery budgets are per running process and per failure chain; they do not persist across plugin reloads or DSH restarts.
 - No live end-to-end verification is claimed for every provider/gateway error class; see [VERIFICATION.md](VERIFICATION.md).

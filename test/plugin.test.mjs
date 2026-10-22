@@ -25,9 +25,11 @@ function harness(t, config = {}) {
   }
   apply(ctx, config)
   const controller = new AbortController()
+  let header
   const agent = {
     id: 's1',
     status: 'running',
+    session: { requestHeader: () => header === undefined ? undefined : { config: header } },
     inbox: {
       nextTurn: [],
       nextStep: [],
@@ -61,6 +63,7 @@ function harness(t, config = {}) {
     },
     claim(message) { this.agent.inbox.remove(message.id); this.emit('agent/inbox/claimed', { agent, message }) },
     goIdle() { this.agent.status = 'idle'; this.emit('agent/status', { agent: this.agent, status: 'idle' }) },
+    setHeader(provider, model) { header = { provider, model } },
     async advance(ms) { await Promise.resolve(); await Promise.resolve(); t.mock.timers.tick(ms) },
     async dispose() { for (const cleanup of cleanups) await cleanup?.() },
   }
@@ -647,15 +650,98 @@ test('restart prompt is bounded and keeps the failure fact visible', () => {
   assert.ok(text.length < 500, 'restart prompt must stay bounded')
 })
 
+test('after retries and turn restarts are exhausted, one request fails over to deepseek flash', async t => {
+  const h = harness(t, { delayMs: 1, maxContinues: 1, maxRestarts: 1, fallbackProvider: 'deepseek-account', fallbackModel: 'deepseek-flash' })
+  h.setHeader('ds', 'gpt-6.1-sol')
+  // Turn 1: one in-step retry, then the bounded restart is consumed.
+  let result = h.recover()
+  await h.advance(1)
+  await result
+  assert.equal(await h.recover(), undefined)
+  h.goIdle()
+  assert.equal(h.agent.followups.length, 1)
+  h.claim(h.agent.followups[0])
+  // Turn 2: the same budget is spent again; the restart allowance is gone.
+  result = h.recover({ turn: 2 })
+  await h.advance(1)
+  await result
+  assert.deepEqual(await h.recover({ turn: 2 }), { kind: 'retry' }, 'failover retries the same step on a new route')
+  const decision = await h.waterfall('agent/request', { agent: h.agent, turn: 2, step: 1, signal: h.controller.signal }, { provider: 'ds', model: 'gpt-6.1-sol', reasoningEffort: 'high' })
+  assert.equal(decision.provider, 'deepseek-account')
+  assert.equal(decision.model, 'deepseek-flash')
+  assert.equal(decision.reasoningEffort, 'high')
+  await h.dispose()
+})
+
+test('the failover route stops being forced once model selection catches up', async t => {
+  const h = harness(t, { delayMs: 1, maxContinues: 1, maxRestarts: 0, fallbackProvider: 'deepseek-account', fallbackModel: 'deepseek-flash' })
+  h.setHeader('ds', 'gpt-6.1-sol')
+  let result = h.recover()
+  await h.advance(1)
+  await result
+  assert.deepEqual(await h.recover(), { kind: 'retry' })
+  h.setHeader('deepseek-account', 'deepseek-flash')
+  const caughtUp = await h.waterfall('agent/request', { agent: h.agent, turn: 1, step: 1, signal: h.controller.signal }, { provider: 'deepseek-account', model: 'deepseek-flash' })
+  assert.equal(caughtUp.provider, 'deepseek-account')
+  // Once the normal selection follows the header, an unrelated decision is left alone.
+  const plain = await h.waterfall('agent/request', { agent: h.agent, turn: 1, step: 2, signal: h.controller.signal }, { provider: 'ds', model: 'gpt-6.1-sol' })
+  assert.equal(plain.provider, 'ds')
+  await h.dispose()
+})
+
+test('an explicit model selection clears the automatic failover', async t => {
+  const h = harness(t, { delayMs: 1, maxContinues: 1, maxRestarts: 0, fallbackProvider: 'deepseek-account', fallbackModel: 'deepseek-flash' })
+  h.setHeader('ds', 'gpt-6.1-sol')
+  let result = h.recover()
+  await h.advance(1)
+  await result
+  assert.deepEqual(await h.recover(), { kind: 'retry' })
+  h.emit('session/event', { id: 's1' }, { type: 'model/selection', data: { provider: 'ds', model: 'gpt-6.1-sol' } })
+  const decision = await h.waterfall('agent/request', { agent: h.agent, turn: 1, step: 1, signal: h.controller.signal }, { provider: 'ds', model: 'gpt-6.1-sol' })
+  assert.equal(decision.provider, 'ds')
+  assert.equal(decision.model, 'gpt-6.1-sol')
+  await h.dispose()
+})
+
+test('the failover is announced once in the conversation', async t => {
+  const h = harness(t, { delayMs: 1, maxContinues: 1, maxRestarts: 0, fallbackProvider: 'deepseek-account', fallbackModel: 'deepseek-flash' })
+  h.setHeader('ds', 'gpt-6.1-sol')
+  let result = h.recover()
+  await h.advance(1)
+  await result
+  assert.deepEqual(await h.recover(), { kind: 'retry' })
+  const first = await h.waterfall('agent/pre-step', { agent: h.agent, messages: [], signal: h.controller.signal, step: 2 }, { kind: 'next-step', messages: [] })
+  assert.equal(first.messages.length, 1)
+  assert.equal(first.messages[0].source.kind, 'model-selection')
+  assert.match(first.messages[0].content[0].text, /deepseek-account\/deepseek-flash/)
+  const second = await h.waterfall('agent/pre-step', { agent: h.agent, messages: [], signal: h.controller.signal, step: 3 }, { kind: 'next-step', messages: [] })
+  assert.equal(second.messages.length, 0)
+  await h.dispose()
+})
+
+test('failover stays disabled when no emergency route is configured', async t => {
+  const h = harness(t, { delayMs: 1, maxContinues: 1, maxRestarts: 0 })
+  let result = h.recover()
+  await h.advance(1)
+  await result
+  assert.equal(await h.recover(), undefined)
+  await h.dispose()
+})
+
 test('config validates restart caps, classification switches and rejects unsafe values', () => {
   assert.equal(resolveConfig().maxRestarts, 2)
   assert.equal(resolveConfig().retryUnclassified, true)
   assert.deepEqual(resolveConfig().excludeIncludes, [])
+  assert.equal(resolveConfig().fallbackProvider, undefined)
+  assert.equal(resolveConfig({ fallbackProvider: 'deepseek-account', fallbackModel: 'deepseek-flash' }).fallbackModel, 'deepseek-flash')
   for (const raw of [
     { maxRestarts: -1 }, { maxRestarts: 1.5 }, { maxRestarts: Number.MAX_SAFE_INTEGER + 1 },
     { delayMs: 2147483648 }, { maxContinues: Number.MAX_SAFE_INTEGER + 1 },
     { retryUnclassified: 'yes' }, { retryUnclassified: 1 },
     { excludeIncludes: 'x' }, { excludeIncludes: [42] },
+    { fallbackProvider: 'deepseek-account' }, { fallbackModel: 'deepseek-flash' },
+    { fallbackProvider: '', fallbackModel: 'deepseek-flash' },
+    { fallbackProvider: 1, fallbackModel: 'deepseek-flash' },
     { toString: 'x' }, { delayMs: 100, maxDelayMs: 10 },
   ]) assert.throws(() => resolveConfig(raw))
   assert.throws(() => resolveConfig({ unknownKnob: true }), /unknown config key/)

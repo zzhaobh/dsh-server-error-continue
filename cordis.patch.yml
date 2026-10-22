@@ -14,3 +14,6 @@
           - overloaded
         excludeIncludes: []
         retryUnclassified: true
+    # Emergency route after all retries and turn restarts are spent:
+    # fallbackProvider: deepseek-account
+    # fallbackModel: deepseek-flash

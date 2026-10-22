@@ -1,6 +1,6 @@
 {
   "name": "@zzhaobh/dsh-server-error-continue",
-  "version": "2.3.1",
+  "version": "2.4.0",
   "description": "Bounded, cancellable recovery for transient model-request failures in DeepSeek Harness: same-request retries, provider-exhaustion escalation, and bounded same-session turn restarts, guarded by a permanent-failure denylist.",
   "type": "module",
   "main": "index.js",
