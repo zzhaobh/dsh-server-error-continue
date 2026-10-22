@@ -211,6 +211,7 @@ test('content filtering wins over transport and replay overrides', () => {
     { code: 'SERVER', status: 503, message: 'Connection error. Response incomplete: content_filter' },
     { code: 'INVALID_REQUEST', message: "Invalid 'input[85].id': 'item_x'. Expected an ID that begins with 'msg'. Response incomplete: content_filter" },
     { code: 'CONTENT_FILTER', message: 'blocked' },
+    { code: 'PI_AI_ERROR', message: "Expected an ID that begins with 'msg'. content_policy_violation" },
   ]) {
     assert.equal(matches(failure), false, failure.message)
     assert.equal(hasRouteReplayMismatch(failure), false, failure.message)
