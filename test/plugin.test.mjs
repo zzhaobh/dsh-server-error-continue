@@ -27,6 +27,7 @@ function harness(t, config = {}) {
   const controller = new AbortController()
   const agent = {
     id: 's1',
+    status: 'running',
     inbox: {
       nextTurn: [],
       nextStep: [],
@@ -59,6 +60,7 @@ function harness(t, config = {}) {
       return invoke(0)
     },
     claim(message) { this.agent.inbox.remove(message.id); this.emit('agent/inbox/claimed', { agent, message }) },
+    goIdle() { this.agent.status = 'idle'; this.emit('agent/status', { agent: this.agent, status: 'idle' }) },
     async advance(ms) { await Promise.resolve(); await Promise.resolve(); t.mock.timers.tick(ms) },
     async dispose() { for (const cleanup of cleanups) await cleanup?.() },
   }
@@ -219,6 +221,8 @@ test('provider-exhausted retryable codes escalate straight to a turn restart', a
   const failure = { code: 'TRANSPORT', message: 'DeepSeek Messages transport failed' }
   const result = await h.recover({ failure, retryPolicy: { mode: 'normal', retryableCodes: ['TRANSPORT', 'TIMEOUT'] } })
   assert.equal(result, undefined, 'the built-in retry already spent its budget; do not stack more identical requests')
+  assert.equal(h.agent.followups.length, 0, 'the restart waits for the idle transition')
+  h.goIdle()
   assert.equal(h.agent.followups.length, 1)
   assert.equal(h.agent.followups[0].source.kind, 'server-error-continue')
   await h.dispose()
@@ -329,6 +333,8 @@ test('default in-step budget stops after three extra requests and escalates to o
     assert.deepEqual(await result, { kind: 'retry' })
   }
   assert.equal(await h.recover(), undefined)
+  assert.equal(h.agent.followups.length, 0, 'the restart waits for the idle transition')
+  h.goIdle()
   assert.equal(h.agent.followups.length, 1)
   const followup = h.agent.followups[0]
   assert.equal(followup.role, 'user')
@@ -406,6 +412,7 @@ test('restart budget is bounded per failure chain and reset by a completed turn'
   await h.advance(1)
   assert.deepEqual(await result, { kind: 'retry' })
   assert.equal(await h.recover(), undefined)
+  h.goIdle()
   assert.equal(h.agent.followups.length, 1)
   // Claim and run the restarted turn: it gets a fresh in-step budget.
   h.claim(h.agent.followups[0])
@@ -413,6 +420,7 @@ test('restart budget is bounded per failure chain and reset by a completed turn'
   await h.advance(1)
   assert.deepEqual(await result, { kind: 'retry' })
   assert.equal(await h.recover({ turn: 2 }), undefined)
+  h.goIdle()
   assert.equal(h.agent.followups.length, 1, 'restart budget must stay bounded')
   // A completed turn closes the chain and replenishes the restart budget.
   h.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
@@ -420,6 +428,7 @@ test('restart budget is bounded per failure chain and reset by a completed turn'
   await h.advance(1)
   assert.deepEqual(await result, { kind: 'retry' })
   assert.equal(await h.recover({ turn: 3 }), undefined)
+  h.goIdle()
   assert.equal(h.agent.followups.length, 2)
   await h.dispose()
 })
@@ -430,6 +439,7 @@ test('a real user prompt withdraws a queued restart and resets its budget', asyn
   await h.advance(1)
   await result
   assert.equal(await h.recover(), undefined)
+  h.goIdle()
   assert.equal(h.agent.followups.length, 1)
   const queued = h.agent.followups[0]
   const user = userMessage()
@@ -443,6 +453,7 @@ test('a real user prompt withdraws a queued restart and resets its budget', asyn
   await h.advance(1)
   assert.deepEqual(await result, { kind: 'retry' })
   assert.equal(await h.recover({ turn: 2 }), undefined)
+  h.goIdle()
   assert.equal(h.agent.followups.length, 2)
   await h.dispose()
 })
@@ -453,10 +464,12 @@ test('a foreign automatic prompt also withdraws a queued restart', async t => {
   await h.advance(1)
   await result
   await h.recover()
+  h.goIdle()
   const queued = h.agent.followups[0]
   assert.ok(queued)
-  staticGoalMessage(h)
+  const goal = staticGoalMessage(h)
   assert.equal(h.agent.inbox.nextTurn.some(message => message.id === queued.id), false)
+  h.claim(goal)
   result = h.recover({ turn: 2 })
   await h.advance(1)
   assert.deepEqual(await result, { kind: 'retry' })
@@ -467,6 +480,7 @@ function staticGoalMessage(h) {
   const goal = { id: 'g1', role: 'user', content: [{ type: 'text', text: '<goal_round>continue</goal_round>' }], source: { kind: 'goal', goalId: 'g', revision: 1, round: 1 } }
   h.agent.inbox.nextTurn.push(goal)
   h.emit('agent/inbox/inserted', { agent: h.agent, message: goal })
+  return goal
 }
 
 test('a discarded restart refunds its budget slot', async t => {
@@ -475,6 +489,7 @@ test('a discarded restart refunds its budget slot', async t => {
   await h.advance(1)
   await result
   await h.recover()
+  h.goIdle()
   const queued = h.agent.followups[0]
   h.agent.inbox.remove(queued.id)
   h.emit('agent/inbox/discarded', { agent: h.agent, message: queued })
@@ -482,17 +497,57 @@ test('a discarded restart refunds its budget slot', async t => {
   await h.advance(1)
   assert.deepEqual(await result, { kind: 'retry' })
   assert.equal(await h.recover({ turn: 2 }), undefined)
+  h.goIdle()
   assert.equal(h.agent.followups.length, 2)
   await h.dispose()
 })
 
-test('no restart is queued while the agent already has pending input', async t => {
+test('a turn restart is queued from the idle transition, not during the failing turn', async t => {
+  const h = harness(t, { delayMs: 1, maxContinues: 1 })
+  let result = h.recover()
+  await h.advance(1)
+  await result
+  assert.equal(await h.recover(), undefined)
+  assert.equal(h.agent.followups.length, 0)
+  h.goIdle()
+  assert.equal(h.agent.followups.length, 1)
+  await h.dispose()
+})
+
+test('a pending user prompt takes precedence over the restart', async t => {
   const h = harness(t, { delayMs: 1, maxContinues: 1 })
   let result = h.recover()
   await h.advance(1)
   await result
   h.agent.inbox.nextTurn.push(userMessage())
   assert.equal(await h.recover(), undefined)
+  h.goIdle()
+  assert.equal(h.agent.followups.length, 0)
+  await h.dispose()
+})
+
+test('a pending automatic notice does not block the restart', async t => {
+  const h = harness(t, { delayMs: 1, maxContinues: 1 })
+  let result = h.recover()
+  await h.advance(1)
+  await result
+  const notice = { id: 'n1', role: 'user', content: [{ type: 'text', text: 'subagent finished' }], source: { kind: 'subagent-settled', form: 'notice' } }
+  h.agent.inbox.nextStep.push(notice)
+  assert.equal(await h.recover(), undefined)
+  h.goIdle()
+  assert.equal(h.agent.followups.length, 1)
+  assert.deepEqual(h.agent.inbox.nextStep, [notice])
+  await h.dispose()
+})
+
+test('a pending goal round takes precedence over the restart', async t => {
+  const h = harness(t, { delayMs: 1, maxContinues: 1 })
+  let result = h.recover()
+  await h.advance(1)
+  await result
+  staticGoalMessage(h)
+  assert.equal(await h.recover(), undefined)
+  h.goIdle()
   assert.equal(h.agent.followups.length, 0)
   await h.dispose()
 })
@@ -504,6 +559,7 @@ test('no restart is queued after a user stop', async t => {
   await result
   h.controller.abort()
   assert.equal(await h.recover(), undefined)
+  h.goIdle()
   assert.equal(h.agent.followups.length, 0)
   await h.dispose()
 })
@@ -514,6 +570,7 @@ test('pre-step admits the reserved restart with a fresh request series', async t
   await h.advance(1)
   await result
   await h.recover()
+  h.goIdle()
   const restart = h.agent.inbox.nextTurn[0]
   h.claim(restart)
   const decision = await h.waterfall('agent/pre-step', { agent: h.agent, messages: [restart], signal: h.controller.signal }, { kind: 'enter', messages: [restart] })
@@ -528,6 +585,7 @@ test('pre-step rejects a restart whose reservation was reset', async t => {
   await h.advance(1)
   await result
   await h.recover()
+  h.goIdle()
   const restart = h.agent.inbox.nextTurn[0]
   h.claim(restart)
   h.emit('session/event', { id: 's1' }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
@@ -542,6 +600,7 @@ test('unload withdraws a queued restart prompt', async t => {
   await h.advance(1)
   await result
   await h.recover()
+  h.goIdle()
   const queued = h.agent.followups[0]
   assert.ok(h.agent.inbox.nextTurn.some(message => message.id === queued.id))
   await h.dispose()
@@ -554,6 +613,7 @@ test('maxRestarts zero keeps the same-request-only behavior', async t => {
   await h.advance(1)
   await result
   assert.equal(await h.recover(), undefined)
+  h.goIdle()
   assert.equal(h.agent.followups.length, 0)
   await h.dispose()
 })

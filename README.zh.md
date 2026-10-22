@@ -89,20 +89,20 @@ profile 覆盖示例：
 4. **网关伪 400 override**：加密 reasoning 无法验证/解密、`previous_response_id ... not found`、`上游流中途断开` / `TransferEncodingError` / `ConnectionResetError` / incomplete payload/chunked read 等传输中断文本先按瞬态处理（`excludeIncludes` 可否决），优先于 400/`INVALID_REQUEST` 的终止判断。`Response incomplete: content_filter` 等内容过滤截断仍保持终止。
 5. 同请求重试在 `agent/request-error` waterfall 中后置，其他恢复器（包括 DSH 内置 provider retry）优先。
 6. provider `normal` 策略已管理并耗尽某码时，不再叠加同样的请求，直接进入回合重启阶段；provider `always` 策略保持独占，本插件不介入。
-7. 回合重启通过 `agent.followup()` 排队一条 `source.kind: server-error-continue`（不是 `user`）的显式重启提示；DSH 随即开启新 turn、发新请求。
+7. 回合重启**不在失败回合内排队**：错误路径会让 driver 直接退出，回合内 followup 不会唤醒 agent。插件先记录 restart intent，等 agent 进入 idle 后再用 `agent.followup()` 排队 `source.kind: server-error-continue`（不是 `user`）的显式重启提示，从而真正唤醒新 turn、发新请求。
 
 ## 重启链的生命周期
 
 - 计数绑定 Agent 上的失败链：成功回合（`turn/end` 原因不是 `error`）、真实用户输入、插件卸载都会结束链并归零。
 - 真实用户消息或其他自动生产者（goal round、schedule、job 唤醒等）插入 inbox 时，排队中的重启提示会被撤回并让位。
 - 用户停止会清空 inbox；取消信号置位后不再排队重启。
-- 已有 pending 输入时不排队重启，避免自动回合插到用户输入之前。
+- 已有 pending 用户消息或 goal round 时让位；待处理的自动通知（subagent 结果、schedule 提醒等）不再阻止重启，会与新回合一起被消费。
 - 卸载/重载会撤回未 claim 的重启提示并等待在途恢复结束；`agent/pre-step` 校验预约，失效则 reject。
 - 排队后被撤回或 discarded 的重启退还预算槽位；已 claim 后因校验失败被拒的不退。
 
 ## 验证与边界
 
-- 单测：`node --test test/plugin.test.mjs`；当前 47 PASS，完整记录与证据边界见 [VERIFICATION.md](VERIFICATION.md)。
+- 单测：`node --test test/plugin.test.mjs`；当前 50 PASS，完整记录与证据边界见 [VERIFICATION.md](VERIFICATION.md)。
 - CI 在 Node 20/22/24 上运行 `node --check` 与完整测试。
 - 只处理“流内 finish error”；流开始前抛出的异常，以及不经过 agent loop 的直连 LLM 调用（会话标题、压缩摘要等）不在覆盖范围内。
 - “未分类即瞬态”是有界但偏乐观的策略：未知永久错误可能先消耗 `maxContinues` 次重试和最多 `maxRestarts` 次重启才终止；可用 `retryUnclassified: false` 或 `excludeIncludes` 收紧。

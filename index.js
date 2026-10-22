@@ -279,9 +279,9 @@ function isRestartMessage(message) {
 function isUserMessage(message) {
   return sourceOf(message)?.kind === 'user'
 }
-/** Count every pending prompt the agent would run before a restarted turn. */
-function queuedInput(agent) {
-  return (agent.inbox?.nextTurn?.length ?? 0) + (agent.inbox?.nextStep?.length ?? 0)
+/** Whether one message is an automatic goal round queued by the goal driver. */
+function isGoalMessage(message) {
+  return sourceOf(message)?.kind === 'goal'
 }
 /** Render the model-visible restart prompt retained in session history. */
 export function restartPrompt(failure, restart, maxRestarts) {
@@ -354,7 +354,7 @@ export function apply(ctx, rawConfig = {}) {
   function chainOf(agent) {
     let state = chains.get(agent)
     if (state === undefined) {
-      state = { restarts: 0, pending: undefined }
+      state = { restarts: 0, pending: undefined, intent: undefined }
       chains.set(agent, state)
     }
     return state
@@ -384,13 +384,15 @@ export function apply(ctx, rawConfig = {}) {
     dropPending(agent, state, true)
     state.restarts = 0
     state.pending = undefined
+    state.intent = undefined
   }
 
   /**
-   * Queue one same-session turn restart after the in-step budget is exhausted.
-   * Returns whether a restart prompt was queued.
+   * Record a restart intent while the failing turn is still running. The turn
+   * error path throws out of the driver, so a queued followup here would never
+   * wake the agent; the prompt is queued from the idle transition instead.
    */
-  function scheduleRestart(agent, failure, signal, used) {
+  function requestRestart(agent, failure, signal, used) {
     if (config.maxRestarts === 0) return false
     const state = chainOf(agent)
     if (state.pending !== undefined && state.pending.phase === 'queued') return false
@@ -399,12 +401,33 @@ export function apply(ctx, rawConfig = {}) {
       return false
     }
     if (signal.aborted || ctx.agents.get(agent.id) !== agent) return false
-    if (queuedInput(agent) > 0) {
-      ctx.logger.warn('[server-error-continue] agent %s has pending input; not restarting the turn', agent.id)
+    state.intent = { failure, signal, used }
+    ctx.logger.warn('[server-error-continue] agent %s recorded a turn restart intent after %d retries (%s)', agent.id, used, codeOf(failure) ?? 'UNKNOWN')
+    return true
+  }
+
+  /** Queue the pending restart once the agent is idle, so followup actually wakes the driver. */
+  function queueRestart(agent) {
+    const state = chains.get(agent)
+    const intent = state?.intent
+    if (state === undefined || intent === undefined) return false
+    state.intent = undefined
+    if (config.maxRestarts === 0) return false
+    if (ctx.agents.get(agent.id) !== agent) return false
+    if (agent.status !== 'idle') return false
+    if (intent.signal?.aborted) return false
+    if (state.pending !== undefined && state.pending.phase === 'queued') return false
+    if (state.restarts >= config.maxRestarts) {
+      ctx.logger.warn('[server-error-continue] agent %s exhausted %d turn restarts; leaving the failure terminal', agent.id, config.maxRestarts)
+      return false
+    }
+    const pendingTurn = agent.inbox?.nextTurn ?? []
+    if (pendingTurn.some(message => isUserMessage(message) || isGoalMessage(message))) {
+      ctx.logger.warn('[server-error-continue] agent %s has a pending user or goal turn; not restarting after it', agent.id)
       return false
     }
     const restart = state.restarts + 1
-    const message = createRestartMessage(failure, restart, config.maxRestarts)
+    const message = createRestartMessage(intent.failure, restart, config.maxRestarts)
     try {
       agent.followup(message)
     } catch (error) {
@@ -414,7 +437,7 @@ export function apply(ctx, rawConfig = {}) {
     state.restarts = restart
     state.pending = { id: message.id, phase: 'queued', restart }
     queuedRestarts.add(agent)
-    ctx.logger.warn('[server-error-continue] agent %s queued turn restart %d/%d after %d in-step retries', agent.id, restart, config.maxRestarts, used)
+    ctx.logger.warn('[server-error-continue] agent %s queued turn restart %d/%d after %d in-step retries', agent.id, restart, config.maxRestarts, intent.used)
     return true
   }
 
@@ -442,7 +465,7 @@ export function apply(ctx, rawConfig = {}) {
         return
       }
       ctx.logger.warn('[server-error-continue] agent %s escalating %s to a turn restart after provider retries', agent.id, codeOf(failure) ?? 'UNKNOWN')
-      scheduleRestart(agent, failure, fused, 0)
+      requestRestart(agent, failure, fused, 0)
       return
     }
     if (!matches(failure)) return
@@ -454,7 +477,7 @@ export function apply(ctx, rawConfig = {}) {
     if (config.maxContinues > 0 && state.used >= config.maxContinues) {
       ctx.logger.warn('[server-error-continue] agent %s stopped after %d extra request retries', agent.id, state.used)
       // Escalate to a bounded new turn instead of repeating the same request forever.
-      scheduleRestart(agent, failure, fused, state.used)
+      requestRestart(agent, failure, fused, state.used)
       return
     }
     const exponential = config.delayMs === 0 ? 0 : Math.min(config.maxDelayMs, config.delayMs * 2 ** Math.min(state.used, 31))
@@ -546,11 +569,17 @@ export function apply(ctx, rawConfig = {}) {
     }
     return { ...decision, startsRequestSeries: true }
   })
+  // Restart prompts must be queued from the idle transition: the turn-error path
+  // throws out of the driver before it can consume queued inbox input.
+  const disposeStatus = ctx.on('agent/status', ({ agent, status }) => {
+    if (status !== 'idle') return
+    queueRestart(agent)
+  })
   const disposeAgent = ctx.on('agent/disposed', ({ agent }) => {
     forget(agent)
   })
   ctx.effect(() => async () => {
-    for (const dispose of [disposeListener, disposeClaimed, disposeDiscarded, disposeInserted, disposeTurnEnd, disposePreStep, disposeAgent]) dispose()
+    for (const dispose of [disposeListener, disposeClaimed, disposeDiscarded, disposeInserted, disposeTurnEnd, disposePreStep, disposeStatus, disposeAgent]) dispose()
     for (const agent of [...queuedRestarts]) {
       const state = chains.get(agent)
       if (state !== undefined) dropPending(agent, state, false)
