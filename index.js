@@ -204,14 +204,23 @@ export function hasTransientOverride(message) {
   return TRANSIENT_OVERRIDE_TEXT.some(pattern => pattern.test(message))
 }
 
+/** Content filtering is a policy outcome, never a transport or replay fault. */
+export function isContentFilterFailure(error) {
+  const code = codeOf(error)?.toUpperCase()
+  return code === 'CONTENT_FILTER' || code === 'CONTENT_POLICY_VIOLATION'
+    || /\bcontent[_ -](?:filter|policy)\b/i.test(messageOf(error))
+}
+
 /** Whether a route rejected its own replayed history by item-ID schema. */
 export function hasRouteReplayMismatch(error) {
+  if (isContentFilterFailure(error)) return false
   const message = messageOf(error)
   return ROUTE_REPLAY_MISMATCH_TEXT.some(pattern => pattern.test(message))
 }
 
 /** Whether one failure is a permanent fact no retry rule may override. */
 export function isPermanentFailure(error, excludes = []) {
+  if (isContentFilterFailure(error)) return true
   const message = messageOf(error).toLowerCase()
   if (excludes.some(needle => message.includes(needle))) return true
   // Gateway replay faults look like malformed 400 requests to the adapter but recover on a fresh route.
@@ -534,6 +543,16 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   async function recover(payload, next) {
+    // Policy blocks are not outages. Veto nested recovery owners, discard stale
+    // restart/failover intent and preserve the original failure for the driver.
+    if (isContentFilterFailure(payload.failure)) {
+      const { agent } = payload
+      resetChain(agent)
+      attempts.delete(agent)
+      failovers.delete(agent)
+      ctx.logger.warn('[server-error-continue] agent %s content_filter: skipping automatic recovery; no retry, restart or fallback; review the task before continuing', agent.id)
+      return
+    }
     // Other recovery owners (including built-in retry) have precedence.
     const downstream = await next()
     if (downstream !== undefined) return downstream
@@ -601,7 +620,7 @@ export function apply(ctx, rawConfig = {}) {
     const tracked = operation.finally(() => active.delete(tracked))
     active.add(tracked)
     return tracked
-  })
+  }, { prepend: true })
   // A claimed restart no longer needs withdrawal; a discarded one refunds its slot.
   const disposeClaimed = ctx.on('agent/inbox/claimed', ({ agent, message }) => {
     const state = chains.get(agent)
