@@ -37,6 +37,9 @@ const TERMINAL_CODES = new Set([
 const FALLBACK_CODES = new Set(['PI_AI_ERROR', 'UNKNOWN'])
 // HTTP statuses that are transient despite being 4xx.
 const TRANSIENT_STATUS = new Set([408, 425, 429])
+// Provider-managed transport codes that stay recoverable even when a provider
+// supplies no retry policy; otherwise a missing policy would make them terminal.
+const TRANSIENT_CODES = new Set(['SERVER', 'TIMEOUT', 'TRANSPORT', 'RATE_LIMIT', 'EMPTY_RESPONSE'])
 // Non-transient facts no gateway wording may override. Matched before every retry rule.
 const PERMANENT_TEXT = Object.freeze([
   /invalid[_ ](?:schema|request|parameter|argument|api[_ ]key|model|response)/,
@@ -100,6 +103,7 @@ const TRANSIENT_OVERRIDE_TEXT = Object.freeze([
   /not enough data to satisfy transfer length header/,
   /connectionreseterror/,
   /connection reset by peer/,
+  /connection (?:error|failed|failure)/,
   /network name is no longer available/,
   /incomplete chunked read/,
   /peer closed connection without sending (?:complete|full) message body/,
@@ -114,6 +118,10 @@ const TRANSIENT_TEXT = Object.freeze([
   /upstream request failed/,
   /upstream (?:connect error|response|service|request)/,
   /connection (?:reset|refused|closed|terminated|aborted|termination)/,
+  /connection (?:error|failed|failure)/,
+  /connect error/,
+  /网络(?:连接)?错误/,
+  /连接失败/,
   /disconnect/,
   /bad gateway/,
   /gateway time-?out/,
@@ -214,7 +222,7 @@ export function createMatcher(config) {
     const status = statusOf(error)
     const message = messageOf(error).toLowerCase()
     if (hasTransientOverride(message)) return true
-    if (codes.has(code)) return true
+    if (codes.has(code) || TRANSIENT_CODES.has(code)) return true
     if (status !== undefined && status >= 500 && status <= 599) return true
     if (status !== undefined && TRANSIENT_STATUS.has(status)) return true
     // PI_AI_ERROR and UNKNOWN are generic adapter wrappers, not normalized codes.

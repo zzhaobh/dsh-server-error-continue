@@ -15,7 +15,7 @@ node --check index.js
 node --test test/plugin.test.mjs
 ```
 
-Current result: **50 passing, 0 failing, 0 skipped, exit 0**.
+Current result: **52 passing, 0 failing, 0 skipped, exit 0**.
 
 Coverage includes:
 
@@ -24,6 +24,7 @@ Coverage includes:
 - transient HTTP status exceptions 408/425/429 versus other 4xx;
 - gateway encrypted-reasoning replay faults (`encrypted content ... could not be verified/decrypted`, `previous_response_id ... not found`) retried despite an HTTP 400 / `INVALID_REQUEST` classification, with `excludeIncludes` able to veto the override;
 - upstream mid-stream transport breaks (`上游流中途断开`, `TransferEncodingError`, `ConnectionResetError`, incomplete payload/chunked read, "network name no longer available") retried despite HTTP 400 / `INVALID_REQUEST`, while `Response incomplete: content_filter` stays terminal;
+- standard transport codes (`SERVER`, `TIMEOUT`, `TRANSPORT`, `RATE_LIMIT`, `EMPTY_RESPONSE`) stay recoverable without a provider retry policy, and `Connection error.` is recognized in normal, strict, and pseudo-400 modes;
 - provider retry policies: `normal` exhaustion escalating straight to a turn restart, `always` policies left untouched, misconfigured permanent codes not restarted;
 - same-request recovery, other recovery owners taking precedence, user stop/unload cancellation, replaced-agent protection, backoff and `Retry-After` handling;
 - turn-restart queuing from the idle transition (not during the failing turn), per-chain budgets, reset on completed turns and real user input, withdrawal when other input arrives, discarded-slot refunds, pending-user/pending-goal precedence, pending automatic notices not blocking a restart, user-stop suppression, `agent/pre-step` reservation checks, unload withdrawal, and `maxRestarts: 0` compatibility.
@@ -39,7 +40,7 @@ These observations motivated the compatibility work; session identifiers and loc
 - A provider-managed `TRANSPORT` failure exhausted the built-in retry budget and failed the turn in an earlier session, which motivated escalation after provider exhaustion.
 - A subagent session failed with `encrypted content ... could not be verified` while replaying a reasoning item produced earlier by a different upstream account; the same session history succeeded after a later retry, which motivated the replay-fault transient override.
 - A later turn failed with `upstream_error: 上游流中途断开: Response payload is not completed ... TransferEncodingError ... ConnectionResetError`; the adapter classified it as `INVALID_REQUEST` because the text embeds a "400", and the step produced a single attempt before the turn failed. The message is a mid-stream network break, not an invalid request, which motivated the transport-break override. `Response incomplete: content_filter` was also observed and stays permanent.
-- Two long goal-driven turns exhausted the built-in provider budget on `TRANSPORT` `Connection error.` (five retries each) and then failed the turn without a restart prompt. Code inspection showed why: the agent-loop turn-error path throws out of the driver, so a `followup()` queued during the failing turn never wakes the agent, and the previous pending-input guard also skipped when an automatic notice was queued. 2.3.0 records a restart intent and queues it from the idle transition instead; pending user prompts and goal rounds still take precedence. This behavior is covered by unit tests but was not re-verified against a live outage after the change.
+- Two long goal-driven turns exhausted the built-in provider budget on `TRANSPORT` `Connection error.` (five retries each) and then failed the turn without a restart prompt. Code inspection showed why: the agent-loop turn-error path throws out of the driver, so a `followup()` queued during the failing turn never wakes the agent, and the previous pending-input guard also skipped when an automatic notice was queued. 2.3.0 records a restart intent and queues it from the idle transition instead; pending user prompts and goal rounds still take precedence. 2.3.1 additionally keeps standard transport codes recoverable without a provider policy and recognizes `Connection error.` wording. Both behaviors are covered by unit tests but were not re-verified against a live outage after the change.
 
 ## Boundaries not verified
 

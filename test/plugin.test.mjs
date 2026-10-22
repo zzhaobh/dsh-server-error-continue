@@ -160,6 +160,26 @@ test('gateway encrypted-reasoning replay faults are recoverable despite HTTP 400
   assert.equal(matches({ code: 'INVALID_REQUEST', message: 'invalid request: bad body', status: 400 }), false)
 })
 
+test('standard transport codes and connection-error wording stay recoverable without a provider policy', () => {
+  const matches = matcher()
+  for (const code of ['SERVER', 'TIMEOUT', 'TRANSPORT', 'RATE_LIMIT', 'EMPTY_RESPONSE']) {
+    assert.equal(matches({ code, message: 'opaque failure' }), true, code)
+  }
+  assert.equal(matches({ code: 'TRANSPORT', message: 'Connection error.' }), true)
+  assert.equal(matches({ code: 'PI_AI_ERROR', message: 'Connection error.' }), true)
+  assert.equal(createMatcher(resolveConfig({ retryUnclassified: false }))({ code: 'PI_AI_ERROR', message: 'Connection error.' }), true)
+  // Python gateways can also label a connection break as a 400 pseudo-invalid request.
+  assert.equal(matches({ code: 'INVALID_REQUEST', message: 'Connection error.', status: 400 }), true)
+})
+
+test('a connection error without a provider policy retries the same request', async t => {
+  const h = harness(t, { delayMs: 10 })
+  const result = h.recover({ failure: { code: 'TRANSPORT', message: 'Connection error.' }, retryPolicy: undefined })
+  await h.advance(10)
+  assert.deepEqual(await result, { kind: 'retry' })
+  await h.dispose()
+})
+
 test('upstream mid-stream disconnects are recoverable despite 400/INVALID_REQUEST', () => {
   const matches = matcher()
   const failure = {

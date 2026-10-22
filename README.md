@@ -13,6 +13,7 @@ A DeepSeek Harness (DSH) bundle that adds bounded, cancellable recovery for tran
 - **Unclassified gateway errors** — `PI_AI_ERROR` / `UNKNOWN` wrapper codes fall back to a curated transient-text matcher and, by default, treat unclassified messages as transient (bounded). Strict modes are configurable.
 - **Gateway replay faults** — encrypted-reasoning replay rejected with HTTP 400 (cross-account `encrypted_content` decryption failure) is treated as a transient override rather than a permanent invalid request.
 - **Mid-stream transport breaks** — upstream connections cut mid-response (`TransferEncodingError`, `ConnectionResetError`, incomplete payload or chunked read, "network name no longer available") are retried even when a Python gateway reports them as HTTP 400 / `INVALID_REQUEST`, because the client request is valid and the failure is network-transient.
+- **Transport codes without a provider policy** — `SERVER`, `TIMEOUT`, `TRANSPORT`, `RATE_LIMIT`, and `EMPTY_RESPONSE` remain recoverable even if a provider supplies no retry policy, and connection wording such as `Connection error.` is recognized in both normal and strict modes.
 
 ## Requirements
 
