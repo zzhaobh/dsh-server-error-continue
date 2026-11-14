@@ -4,8 +4,7 @@
       config:
         delayMs: 1000
         maxDelayMs: 30000
-        maxContinues: 3
-        maxRestarts: 2
+        maxContinues: 5
         codes:
           - SERVER
         messageIncludes:
@@ -14,6 +13,3 @@
           - overloaded
         excludeIncludes: []
         retryUnclassified: true
-    # Emergency route after all retries and turn restarts are spent:
-    # fallbackProvider: deepseek-account
-    # fallbackModel: deepseek-flash

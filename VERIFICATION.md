@@ -1,74 +1,98 @@
 # Validation record
 
-This file records the evidence behind the plugin's current behavior and its boundaries. It is not a claim that every provider or gateway failure class was exercised end to end.
+This file records evidence for the 3.0.0 single-hook implementation. It does not claim that every provider or gateway failure was exercised end to end.
 
 ## Environment
 
-- DSH `0.2.1-rc.2` (Desktop carrier), Node.js 24 on macOS.
-- Plugin mounted in a real Cordis context (fiber ACTIVE) and disposed without error.
-- CI runs the same checks on Node 20, 22, and 24 on `ubuntu-latest`.
+- `@deepseek-ai/dsh-agent` `0.2.2-rc.3` in the installed desktop runtime.
+- `@deepseek-ai/cordis` `4.1.0`.
+- Cordis smoke runtime: Node.js `v24.21.0` through the installed Electron binary on macOS.
+- Unit tests also run under the repository's Node.js test runner; CI is configured for the exact minimum Node.js 20.3.0 plus current Node.js 20, 22, and 24.
+- No live or paid model request was made.
+
+## Baseline and TDD evidence
+
+The isolated worktree began at `d6d671c` (`v2.4.2`) with **66/66** existing tests passing.
+
+The new single-hook contract was written before the implementation. Corrected RED tests produced **7 behavioral failures** on 2.4.2:
+
+- ten event hooks instead of one;
+- legacy restart/fallback behavior instead of warning-only compatibility;
+- provider exhaustion escalating to turn restart;
+- cancellation and disposal races before the wait was established;
+- zero-delay configuration accepted.
+
+Test-harness mistakes were fixed before accepting RED evidence. After the rewrite, the core suite passed **19/19**. The expanded matrix then passed **39/39**; four review regression tests brought the final matrix to **43/43**.
 
 ## Automated checks
 
 ```sh
 node --check index.js
-node --test test/plugin.test.mjs
+node --test --test-timeout=10000 test/plugin.test.mjs
 ```
 
-Current result: **66 passing, 0 failing, 0 skipped, exit 0**. Node coverage: lines **95.27%**, branches **85.44%**, functions **95.31%**.
-
-### 2.4.2 TDD evidence: skip content-filter recovery
-
-Journeys were derived from the user's error report, not a plan file. Goal: explicitly classify filtered responses without retry/provider-switch evasion, preserve the original failure, and keep transport errors recoverable.
-
-- RED: `node --test test/plugin.test.mjs` executed 65 tests; 61 passed and 4 failed on mixed filter/transport classification, retry-owner delegation, stale restart intent, and mixed filter/replay failover. Checkpoint `5019272`.
-- Ordering RED: a preexisting always-retry-owner test failed until the guard was prepended. Checkpoint `4be18e9`.
-- GREEN: `node --check index.js && node --test --experimental-test-coverage test/plugin.test.mjs` executed 66 tests, all passed. Checkpoint `6f2853c`.
-- Review identified a text-only `content_policy_violation` suffix gap; reproducer RED checkpoint `e488465`, fix GREEN `5216ac8`.
-- Real installed Cordis check: ACTIVE plugin mount, prepended guard vetoed a preexisting retry callback; original failure unchanged; transport delegation still worked; disposal completed, exit 0. The initial logger assertion failed because the local exporter did not enable WARN level; the corrected exporter captured the diagnostic. No live model request was made.
-
-| Guarantee | Test type | Result |
-|---|---|---|
-| Filter code/text wins over transport/replay hints | unit | PASS |
-| Filter skips retry owners, restart and fallback; preserves failure | mocked Host boundary | PASS |
-| Filter clears stale restart intent | mocked Host boundary | PASS |
-| Prepended filter guard precedes retry owner | unit + installed Cordis | PASS |
-| Missing terminal response event still retries in strict mode | mocked Host boundary | PASS |
-
-No claim that filtering turns into successful completion or that a real filtered task was automatically resumed. Unit tests cover plugin decisions; installed agent-loop source confirms failed responses do not execute tools. A later plugin prepended ahead of this guard could change listener ownership; the actual configured installation order must remain part of runtime verification.
+Current result: **43 passing, 0 failing, 0 cancelled, 0 skipped, exit 0**. Coverage: **99.22% lines, 92.36% branches, 97.30% functions** (`node --test --experimental-test-coverage`). `git diff --check` passes and `npm pack --dry-run` contains nine intended runtime/docs files (13.2kB), with no development plans or test artifacts.
 
 Coverage includes:
 
-- permanent-failure precedence: auth/permission, quota/billing, context length, invalid schema/request/API key, model not found/unsupported, content policy, adapter `deferred`/`pending` states;
-- unclassified `PI_AI_ERROR`/`UNKNOWN` gateway errors treated as transient by default, and strict allowlist mode with `retryUnclassified: false`;
-- transient HTTP status exceptions 408/425/429 versus other 4xx;
-- gateway encrypted-reasoning replay faults (`encrypted content ... could not be verified/decrypted`, `previous_response_id ... not found`) retried despite an HTTP 400 / `INVALID_REQUEST` classification, with `excludeIncludes` able to veto the override;
-- upstream mid-stream transport breaks (`上游流中途断开`, `TransferEncodingError`, `ConnectionResetError`, incomplete payload/chunked read, "network name no longer available") retried despite HTTP 400 / `INVALID_REQUEST`, while `Response incomplete: content_filter` stays terminal;
-- standard transport codes (`SERVER`, `TIMEOUT`, `TRANSPORT`, `RATE_LIMIT`, `EMPTY_RESPONSE`) stay recoverable without a provider retry policy, and `Connection error.` is recognized in normal, strict, and pseudo-400 modes;
-- provider retry policies: `normal` exhaustion escalating straight to a turn restart, `always` policies left untouched, misconfigured permanent codes not restarted;
-- same-request recovery, other recovery owners taking precedence, user stop/unload cancellation, replaced-agent protection, backoff and `Retry-After` handling;
-- turn-restart queuing from the idle transition (not during the failing turn), per-chain budgets, reset on completed turns and real user input, withdrawal when other input arrives, discarded-slot refunds, pending-user/pending-goal precedence, pending automatic notices not blocking a restart, user-stop suppression, `agent/pre-step` reservation checks, unload withdrawal, and `maxRestarts: 0` compatibility;
-- emergency failover after both in-step retries and turn restarts are spent: one retry is routed to `fallbackProvider`/`fallbackModel`, the request-header hand-off stops forcing the route once normal selection catches up, an explicit `model/selection` event clears it, the conversation notice is emitted once, and no failover occurs when the route is unconfigured;
-- a route replay-schema rejection (`Invalid 'input[85].id' ... Expected an ID that begins with 'msg'`) switches routes immediately without spending a turn restart, is terminal on the emergency route, stays permanent without a configured route, and explains the switch in the conversation notice.
+- exactly one registration: `agent/request-error`; an Agent exposing only `id` needs no private API;
+- normalized `SERVER`, `TIMEOUT`, `TRANSPORT`, `RATE_LIMIT`, and `EMPTY_RESPONSE` retries without provider policy;
+- provider wrapper text, connection reset/refusal, EOF, incomplete chunked responses, missing terminal response events, and encrypted-reasoning transient overrides;
+- authentication, quota, context overflow, invalid request/schema/model, unsupported model, content policy, and ordinary 4xx remaining terminal;
+- content-filter preemption of a downstream always-retry owner;
+- native `normal` policy ownership, native `always` ownership, and downstream decision/error propagation;
+- finite and explicitly unlimited budgets, per-step isolation, exponential backoff, bounded Retry-After, user cancellation, Agent replacement, and disposal;
+- legacy restart/fallback/prompt keys warning and having no behavioral effect.
 
-The suite is hermetic: it uses Node's mock timers and fake Agent/Cordis boundaries, makes no paid model requests, no SSH connections, and no network calls.
+Two development-time hangs were fixture errors, not production defects: Retry-After was initially placed at payload level instead of inside `failure`, and the unlimited test advanced 1ms when exponential backoff correctly required 2ms. The fixtures were corrected; tests now have a 10s timeout and use `setImmediate` to flush microtasks before advancing mock time.
 
-## Observed in real sessions (sanitized)
+## Independent review fixes
 
-These observations motivated the compatibility work; session identifiers and local paths are intentionally omitted.
+A fresh-context reviewer found two Important issues. Both were reproduced before editing:
 
-- A long-running session produced four model requests inside one failed step — one original plus three same-request retries — before the turn failed during a multi-minute "overloaded" window. That confirmed the in-step retry path.
-- A later `PI_AI_ERROR: Upstream request failed` failure produced only one attempt because the old text allowlist did not match it, which motivated the unclassified-gateway-error fallback.
-- A provider-managed `TRANSPORT` failure exhausted the built-in retry budget and failed the turn in an earlier session, which motivated escalation after provider exhaustion.
-- A subagent session failed with `encrypted content ... could not be verified` while replaying a reasoning item produced earlier by a different upstream account; the same session history succeeded after a later retry, which motivated the replay-fault transient override.
-- A later turn failed with `upstream_error: 上游流中途断开: Response payload is not completed ... TransferEncodingError ... ConnectionResetError`; the adapter classified it as `INVALID_REQUEST` because the text embeds a "400", and the step produced a single attempt before the turn failed. The message is a mid-stream network break, not an invalid request, which motivated the transport-break override. `Response incomplete: content_filter` was also observed and stays permanent.
-- Two long goal-driven turns exhausted the built-in provider budget on `TRANSPORT` `Connection error.` (five retries each) and then failed the turn without a restart prompt. Code inspection showed why: the agent-loop turn-error path throws out of the driver, so a `followup()` queued during the failing turn never wakes the agent, and the previous pending-input guard also skipped when an automatic notice was queued. 2.3.0 records a restart intent and queues it from the idle transition instead; pending user prompts and goal rounds still take precedence. 2.3.1 additionally keeps standard transport codes recoverable without a provider policy and recognizes `Connection error.` wording. Both behaviors are covered by unit tests but were not re-verified against a live outage after the change.
-- 2.4.0 adds opt-in emergency failover to `deepseek-account/deepseek-flash` after the restart allowance is spent. It is covered by unit tests for routing, header catch-up, explicit-selection clearing and notice generation, but has not been exercised against a real multi-provider outage; the fallback account must be signed in.
-- A later turn on `ds/gpt-6.1-sol` failed with `ds API error (400): Invalid 'input[85].id': 'item_719f...'. Expected an ID that begins with 'msg'` (`INVALID_REQUEST`). The rejected item belongs to the same provider's stored assistant replay state, so the provider no longer accepts its own history; retrying the same route cannot work. 2.4.1 treats this replay-schema rejection as an immediate route failover instead of a terminal request. The underlying adapter/history mismatch is not repaired, and the emergency route accepting the foreign history has not been live-verified.
+- Mixed permanent/transport wording could bypass the permanent-failure guard. Terminal codes and permanent text now win before any override; only a pseudo-400 without another permanent fact may use the transport/replay override. Regression matrix: terminal codes cannot be bypassed by transient override wording; permanent text wins over transport overrides under wrapper codes; genuine pseudo-invalid-request transport overrides remain retryable.
+- `AbortSignal.any()` requires Node 20.3.0 while the package declared 20.0. The engine is now `>=20.3.0`, CI adds an exact 20.3.0 job, and a metadata regression test locks both values.
+
+The four targeted tests changed from RED to GREEN, followed by the full 43/43 suite, coverage, Cordis smoke, package dry-run, and diff check above. The reviewer independently reran the pre-fix suite and reported no Critical findings.
+
+## Real Cordis mount and disposal
+
+Command:
+
+```sh
+ELECTRON_RUN_AS_NODE=1 \
+DSH_CORDIS_ENTRY="/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/cordis/lib/index.js" \
+"/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness" test/cordis-mount.mjs
+```
+
+Observed output:
+
+```json
+{"ok":true,"cordisContext":true,"runtime":"v24.21.0","registeredHooks":["agent/request-error"],"retry":{"kind":"retry"},"effectsDisposed":2,"networkRequests":0}
+```
+
+The smoke check mounts the real Cordis `Context`, provides only the minimal `agents` registry, invokes the registered listener with a synthetic `TRANSPORT` failure, and receives `{ kind: "retry" }`. Two effects are Cordis's listener disposer plus the plugin's recovery cleanup; both complete. No network request is issued.
+
+Initial smoke-script adjustments were test setup only: services use `ctx.reflect.provide()` on rc3, and Cordis's real LoggerService replaces the unnecessary capture stub.
+
+## Reduced surface evidence
+
+Version 2.4.2 registered ten event hooks and contained 740 lines in `index.js`. Version 3.0.0 registers one event hook and contains 380 lines.
+
+Removed behavior:
+
+- no prompt/context injection or continuation messages;
+- no inbox, followup, session, status, pre-step, request-route, or model-selection listeners;
+- no turn restart or emergency model switching;
+- no provider replay-route bypass;
+- no durable-history reads or writes.
+
+The only retained services are the public request-error waterfall, Agent registry lookup, logger, and effect/disposal support.
 
 ## Boundaries not verified
 
-- No live end-to-end verification for every provider/gateway error class or for the automatic turn-restart path under a real long outage.
-- GUI presentation of restart prompts was not verified.
-- Whether a running DSH host hot-reloads changed Host plugin code depends on HMR and package relinking; restart the host if in doubt.
-- The plugin cannot see errors thrown before a model stream starts, nor direct LLM calls outside the agent loop.
+- No live end-to-end outage was injected into every provider or gateway.
+- No claim that a provider returns within the finite retry budget.
+- Direct `ctx.llm.stream()` calls and model activity outside the agent loop are outside the plugin boundary.
+- Real provider adapters may use additional error wording; `retryUnclassified: false`, `messageIncludes`, and `excludeIncludes` remain the explicit controls for site-specific behavior.
+- A later prepended listener can change waterfall ownership; production profiles should retain the intended recovery order.

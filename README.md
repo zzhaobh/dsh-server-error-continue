@@ -2,137 +2,127 @@
 
 English | [中文](README.zh.md)
 
-[![CI](https://github.com/zzhaobh/dsh-server-error-continue/actions/workflows/ci.yml/badge.svg)](https://github.com/zzhaobh/dsh-server-error-continue/actions/workflows/ci.yml)
+A low-intrusion DeepSeek Harness 3.0.0 plugin that retries recoverable connection, rate-limit, and server failures through the public `agent/request-error` waterfall after a model request has failed.
 
-A DeepSeek Harness (DSH) bundle that adds bounded, cancellable recovery for transient model-request failures. It retries the failed request in place, escalates after a provider's own retry budget is spent, restarts the turn a bounded number of times, and — when that is still not enough — can fail over the next request to a configured emergency route such as `deepseek-account/deepseek-flash`, without fabricating user messages or retrying permanent failures such as authentication, quota, context overflow, or unknown models.
+## Stability contract
 
-- **Same-request retries** — `maxContinues` extra attempts inside the same turn/step, exponential backoff, `Retry-After` support.
-- **Provider-exhaustion escalation** — when a provider's `normal` retry policy has already retried a code and given up, the plugin does not stack more identical requests; it moves straight to a bounded turn restart.
-- **Bounded turn restarts** — a fresh turn (new request) queued through `agent.followup()` from the agent's idle transition, with its own in-step budget, capped per failure chain and withdrawn when real user input arrives or the user stops the turn. Pending user prompts and goal rounds take precedence; pending automatic notices do not block the restart.
-- **Permanent-failure denylist** — auth/permission, quota/billing, context length, invalid schema/request/API key, model not found/unsupported, content policy, content-filter-truncated responses, deferred/pending adapter states stay terminal even if they look transient.
-- **Unclassified gateway errors** — `PI_AI_ERROR` / `UNKNOWN` wrapper codes fall back to a curated transient-text matcher and, by default, treat unclassified messages as transient (bounded). Strict modes are configurable.
-- **Gateway replay faults** — encrypted-reasoning replay rejected with HTTP 400 (cross-account `encrypted_content` decryption failure) is treated as a transient override rather than a permanent invalid request.
-- **Mid-stream transport breaks** — upstream connections cut mid-response (`TransferEncodingError`, `ConnectionResetError`, incomplete payload or chunked read, "network name no longer available") are retried even when a Python gateway reports them as HTTP 400 / `INVALID_REQUEST`, because the client request is valid and the failure is network-transient.
-- **Transport codes without a provider policy** — `SERVER`, `TIMEOUT`, `TRANSPORT`, `RATE_LIMIT`, and `EMPTY_RESPONSE` remain recoverable even if a provider supplies no retry policy, and connection wording such as `Connection error.` is recognized in both normal and strict modes.
-- **Emergency model failover (opt-in)** — after in-step retries and turn restarts are both exhausted, the plugin sends one request to `fallbackProvider`/`fallbackModel` (for example `deepseek-account` / `deepseek-flash`). The new route is written into the durable request header, announced in the conversation as a `model-selection` notice, and stopped as soon as the user explicitly selects a model. A route that rejects its own replayed history by item-ID schema (`Invalid 'input[85].id': 'item_...'. Expected an ID that begins with 'msg'`) fails over immediately: retrying the same history on the same route cannot succeed.
+- **One Host hook only:** `agent/request-error`.
+- No system-prompt injection, continuation prompts, or synthetic user/assistant messages.
+- No session-history access, inbox operations, `followup()`, or Agent lifecycle ownership.
+- No provider/model rewriting, emergency routes, or model switching.
+- DSH's native retryer runs first; this plugin handles only eligible failures left unhandled.
+- No runtime dependencies or build step. Successful requests and turns are untouched.
 
-## Requirements
+## Requirements and installation
 
-- DSH `>=0.2.1-rc.2 <0.3.0` (declared through `engines.dsh`; the bundle is skipped with a warning by installations outside the range unless an exact-version exemption is granted).
-- Node.js 20 or newer.
-- The bundle is Host-only: it contributes a Cordis loader row and no client UI.
-
-## Install
-
-Install or upgrade to the latest commit on `main` with one command:
-
-```sh
-dsh plugin --profile <profile> add "github:zzhaobh/dsh-server-error-continue#main"
-```
-
-Re-run the same command to upgrade: pnpm re-resolves the branch ref, so the lock file moves to the newest commit on `main`. The package is plain JavaScript — no `prepare` script and no pnpm build-script allowance are involved.
-
-For a reproducible install, pin a commit instead:
+- DSH `>=0.2.1-rc.2 <0.3.0`.
+- Node.js 20.3.0 or later (the minimum version with `AbortSignal.any()`).
+- Host-only; no client UI.
 
 ```sh
 dsh plugin --profile <profile> add "github:zzhaobh/dsh-server-error-continue#<commit>"
 ```
 
-Or install a local checkout while developing:
+For local development:
 
 ```sh
 dsh plugin --profile <profile> add /path/to/dsh-server-error-continue
 ```
 
-Verify the layer before booting, then boot:
+Restart the Host after installation, upgrade, or removal and verify that the running instance loaded the intended version.
 
-```sh
-dsh --profile <profile> --dump-config | grep -A6 server-error-continue
-dsh --profile <profile>
-```
+## Migrating from 2.x
 
-The Electron-managed `desktop` profile rejects CLI boot/config-dump commands; manage it through the app's plugin manager or by editing the profile files directly.
+Version 3.0.0 removes the high-intrusion features:
 
-To remove the plugin, `dsh plugin --profile <profile> remove @zzhaobh/dsh-server-error-continue` removes both the dependency and the bundle layer.
+- Turn restarts and automatic `continue` prompts.
+- Inbox/session/status/pre-step listeners.
+- `fallbackProvider` / `fallbackModel` failover.
+- Automatic route switching for provider replay item-ID mismatches.
+
+Legacy `prompt`, `maxRestarts`, `fallbackProvider`, and `fallbackModel` keys are accepted only to emit an `ignored legacy keys` warning. They have no effect; remove them from the profile.
+
+A code managed and exhausted by a native provider `normal` policy receives no second plugin budget and no turn restart. Adjust that provider's own `retryPolicy` when its native budget needs to change.
 
 ## Configuration
 
-Defaults ship in the bundle's [`cordis.patch.yml`](cordis.patch.yml). A profile can override the row in its own `cordis.patch.yml`; a patch replaces the entire `config` value, so restate every key you need.
+Bundle defaults live in [`cordis.patch.yml`](cordis.patch.yml). A profile patch replaces the whole `config` object rather than deep-merging it, so repeat every key you want to retain.
 
-| Key | Default | Meaning |
-|---|---|---|
-| `delayMs` | `1000` | First in-step retry delay; doubles per attempt. |
-| `maxDelayMs` | `30000` | Backoff cap; must be at least `delayMs`. |
-| `maxContinues` | `3` | Extra same-request attempts per failed step. `0` means unlimited (documented opt-in); the turn-restart stage then becomes unreachable. |
-| `maxRestarts` | `2` | Extra turn restarts per failure chain. `0` disables restarts and keeps same-request-only behavior. |
-| `codes` | `["SERVER"]` | Additional always-retryable failure codes. Terminal-code and permanent-text exclusions still win. |
-| `messageIncludes` | `["server_error", "upstream_error", "overloaded"]` | Extra case-insensitive transient substrings for wrapper codes. |
-| `excludeIncludes` | `[]` | Site-specific permanent substrings; a match vetoes both text fallback and the built-in replay override. |
-| `retryUnclassified` | `true` | Whether wrapper codes with no matching permanent/transient text are treated as transient. `false` switches to strict allowlist mode. |
-| `fallbackProvider` | unset | Emergency provider route, used only after all retries and turn restarts are spent. Must be set together with `fallbackModel`. |
-| `fallbackModel` | unset | Emergency model, for example `deepseek-flash`. |
-| `prompt` | `continue` | Legacy v1 key, accepted for compatibility but never sent; configuring it logs a deprecation warning. |
+| Key | Bundle default | Meaning |
+|---|---:|---|
+| `delayMs` | `1000` | First additional-retry delay, doubled thereafter; must be ≥1 |
+| `maxDelayMs` | `30000` | Backoff and accepted `Retry-After` ceiling; must be ≥`delayMs` |
+| `maxContinues` | `5` | Additional attempts per failed step; code default is `3`, explicitly overridden to `5` by the bundle |
+| `codes` | `["SERVER"]` | Additional recoverable codes; permanent exclusions still win |
+| `messageIncludes` | `["server_error", "upstream_error", "overloaded"]` | Extra case-insensitive transient text for wrapper codes |
+| `excludeIncludes` | `[]` | Permanent text exclusions, including transient overrides |
+| `retryUnclassified` | `true` | Treat unknown `PI_AI_ERROR`/`UNKNOWN` wrappers as transient; `false` selects the strict allowlist |
 
-Example profile override:
+`maxContinues: 0` is an explicit unlimited-retry opt-in, ending only on cancellation, Agent replacement, or disposal. Keep a finite default for unattended work.
 
-```yaml
-- id: server-error-continue
-  name: '@zzhaobh/dsh-server-error-continue'
-  config:
-    delayMs: 2000
-    maxDelayMs: 30000
-    maxContinues: 3
-    maxRestarts: 3
-    codes:
-      - SERVER
-    messageIncludes:
-      - server_error
-      - upstream_error
-      - overloaded
-    excludeIncludes: []
-    retryUnclassified: true
-    fallbackProvider: deepseek-account
-    fallbackModel: deepseek-flash
+## Recovery order
+
+1. **Content filtering is terminal:** downstream recovery is not called, so even native `always` cannot bypass the policy outcome.
+2. Call `next()` and preserve a downstream recovery decision or exception.
+3. Leave provider `always` policies in exclusive control.
+4. Treat native `normal` policy budgets as authoritative for their managed codes.
+5. Permanent facts win: authentication/permission, quota/billing, context overflow, invalid schema/request/parameters, missing/unsupported models, content policy, and non-transient 4xx do not retry.
+6. Retry an eligible unhandled failure in the same step, over the same history, with the same provider/model.
+7. Honor cancellation and disposal while waiting; after the wait, confirm the original Agent is still registered before returning `{ kind: "retry" }`.
+
+The plugin only returns DSH's native recovery action. The agent loop performs the retry; the plugin never issues its own network request.
+
+## Transient failures covered
+
+- `SERVER`, `TIMEOUT`, `TRANSPORT`, `RATE_LIMIT`, and `EMPTY_RESPONSE`.
+- HTTP 408, 425, 429, and 5xx.
+- Server, rate-limit, and transport wording wrapped in `PI_AI_ERROR` / `UNKNOWN`.
+- Reset/refused/closed connections, socket hang up, EOF, timeout, broken pipe, and unreachable networks.
+- Mid-stream upstream disconnects, `TransferEncodingError`, `ConnectionResetError`, incomplete chunked reads, and missing terminal response events.
+- Known pseudo-400 gateway affinity failures involving encrypted reasoning verification/decryption or `previous_response_id`.
+
+Set `retryUnclassified: false` to disable optimistic recovery of unknown wrapper text. `excludeIncludes` vetoes text fallback and transient overrides.
+
+This plugin adds no retries for authentication, permission, quota, balance, context overflow, invalid tool/request parameters, missing or unsupported models, content filtering, or ordinary 4xx failures. Explicit terminal codes and permanent facts win even when the text also contains transport or encrypted-reasoning override wording. Explicit native `always`/`normal` policies retain their configured recovery ownership, except that this plugin always vetoes content filtering. Version 3 also never switches models to bypass a provider's replay item-ID rejection.
+
+## Backoff and cancellation
+
+- Backoff doubles from `delayMs` up to `maxDelayMs`.
+- A valid `Retry-After` is not shortened; a hint above `maxDelayMs` leaves the failure terminal rather than waiting without a bound.
+- User cancellation propagates the original `AbortError`; disposal aborts and drains active recovery.
+- Budgets are in-memory only, isolated by Agent + turn + step + signal. No session state is read or persisted.
+
+## Verification and boundaries
+
+```sh
+npm test
+npm pack --dry-run
 ```
 
-## How recovery works
+`test/cordis-mount.mjs` mounts the plugin in the installed Cordis runtime without a model request:
 
-1. **Classify.** Permanent facts are checked before every retry rule: terminal failure codes, permanent text (auth, quota, context, invalid request/schema/API key, model not found/unsupported, content policy, adapter `deferred`/`pending` states), `excludeIncludes`, and non-transient 4xx. Transient 408/425/429 are exceptions. Then `codes` and HTTP 5xx match; finally `PI_AI_ERROR`/`UNKNOWN` fall back to `messageIncludes`, curated transient text (English and Chinese), and `retryUnclassified`.
-2. **Same-request retry.** A match schedules a retry of the same request inside the same step with exponential backoff. Other recovery owners (including DSH's built-in provider retry) get precedence through the request-error waterfall.
-3. **Provider-exhaustion escalation.** If the provider's `normal` retry policy already managed the failing code, the plugin skips further identical requests and schedules a turn restart directly. Provider `always` policies keep ownership; the plugin never races them.
-4. **Bounded turn restart.** The plugin records a restart intent on the exhausted failure and queues the restart prompt when the agent transitions to idle — the turn-error path leaves the driver before it can consume inbox input, so queueing during the failing turn would never wake it. `agent.followup()` from idle starts a new turn with a new model request; the prompt's `source.kind` is `server-error-continue` (not `user`) and it is visible in history as an explicit automatic-restart record. A pending user prompt or goal round takes precedence; pending automatic notices (subagent results, schedule reminders) travel with the restarted turn instead of blocking it.
-5. **Emergency model failover.** When the restart allowance is also spent, the next request is routed to `fallbackProvider`/`fallbackModel` through the `agent/request` waterfall. The durable request header then records the emergency route, so later requests use it without a per-request override; an explicit `model/selection` event clears the failover. A provider-side replay-schema rejection (`Invalid 'input[n].id' ... Expected an ID that begins with 'msg'`) skips the remaining retry budgets and fails over immediately, because the same history cannot succeed on the same route. Other permanent failures never trigger failover, and the feature is disabled unless both keys are configured.
+```sh
+ELECTRON_RUN_AS_NODE=1 \
+DSH_CORDIS_ENTRY="/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/cordis/lib/index.js" \
+"/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness" test/cordis-mount.mjs
+```
 
-A restart chain is bounded per agent: it resets on a non-error turn end, on real user input, or on unload. Queued restarts are withdrawn when user or other automatic input arrives, and `agent/pre-step` rejects a restart whose reservation went stale. Unloading drains in-flight waits and withdraws queued restart prompts.
+See [VERIFICATION.md](VERIFICATION.md) for exact current evidence.
 
-## Content-filter and tool-error handling
+Boundaries:
 
-`Response incomplete: content_filter`, `CONTENT_FILTER`, and `content_policy_violation` mean **skip automatic recovery**, not a transient network outage. The prepended guard vetoes nested retry owners, clears stale restart/failover intent and logs `content_filter: skipping automatic recovery`. It does not retry, restart or switch providers to evade filtering, even when transport/replay text is also present. The original failure is retained: DSH still marks the turn failed, not successfully completed. The agent loop does not execute tool calls from a failed response. Review the task before submitting an allowed new task.
-
-`OpenAI Responses stream ended before a terminal response event` remains a recoverable transport message in strict mode. `invalid justification: expected a non-empty sentence` is file-tool argument validation, not a model-request error; correct the tool arguments instead.
-
-For Desktop dependency upgrades, quit the app completely before running the install command, then reopen it. Installing a version does not prove that the running Host instance has reloaded it.
-
-## Verification and known limits
-
-- Unit tests: `node --test test/plugin.test.mjs` — see [VERIFICATION.md](VERIFICATION.md) for the current pass counts and evidence boundaries.
-- CI runs `node --check` and the full suite on Node 20, 22, and 24.
-- Only in-band model-stream finish errors reach the plugin; errors thrown before a stream starts, and direct LLM calls outside the agent loop (session titles, compaction summaries), are not covered.
-- "Unclassified is transient" is bounded but optimistic: an unknown permanent error may consume `maxContinues` retries and up to `maxRestarts` restarts before surfacing. Use `retryUnclassified: false` or `excludeIncludes` to tighten.
-- Failover only changes the model route; it cannot make an unavailable credential valid. `deepseek-account` must be signed in (or use another configured provider), and switching routes degrades provider-specific replay state to provider-neutral history. The failover route is process-local and is not persisted across an Agent restart.
-- The item-ID rejection is an upstream replay-compatibility problem in the provider/adapter, not in the plugin. Failover is a workaround, not a repair of the stored history; the emergency route must accept the foreign history for the retry to succeed.
-- Restart prompts are visible session messages (same mechanism as goal rounds), not user speech.
-- Recovery budgets are per running process and per failure chain; they do not persist across plugin reloads or DSH restarts.
-- No live end-to-end verification is claimed for every provider/gateway error class; see [VERIFICATION.md](VERIFICATION.md).
+- Only agent-loop model-request failures are covered; direct `ctx.llm.stream()` calls, title generation, and independent summary calls are outside this boundary.
+- Recovery is not guaranteed for every live provider outage or within every finite budget.
+- Unit and Cordis tests prove classification, actions, cancellation, and API surface; they do not replace provider-specific live outage tests.
 
 ## Development
 
 ```sh
 node --check index.js
-node --test test/plugin.test.mjs
+node --test --test-timeout=10000 test/plugin.test.mjs
 ```
 
-No runtime dependencies. The plugin entry exports `apply(ctx, config)`; the bundle loader row is declared in `cordis.patch.yml`.
+The package exports `apply(ctx, config)`. Its bundle contributes only the single loader entry in [`cordis.patch.yml`](cordis.patch.yml).
 
 ## License
 

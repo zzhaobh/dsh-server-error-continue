@@ -2,144 +2,127 @@
 
 [English](README.md) | 中文
 
-[![CI](https://github.com/zzhaobh/dsh-server-error-continue/actions/workflows/ci.yml/badge.svg)](https://github.com/zzhaobh/dsh-server-error-continue/actions/workflows/ci.yml)
+DSH 3.0.0 低侵入模型请求重试插件：只通过公开的 `agent/request-error` waterfall，在模型请求已经失败后，对可恢复的连接、限流和服务端错误执行有界重试。
 
-DeepSeek Harness（DSH）插件包：模型请求因服务端或上游临时错误失败时，按四层顺序恢复——**同请求重试** → **内置重试耗尽后的升级** → **有界回合重启** → **可选应急路由切换（如 deepseek-account/deepseek-flash）**。既不会无限重发同一个请求，也不会把认证、额度、上下文超限、模型不存在这类永久错误当成瞬态错误反复重试；对网关侧“加密 reasoning 无法跨账号解密”“上游流中途断开（TransferEncodingError / ConnectionResetError）”“Connection error.”这类伪 400 也会做有界重试；即使 provider 没有配置 retryPolicy，`SERVER`/`TIMEOUT`/`TRANSPORT`/`RATE_LIMIT`/`EMPTY_RESPONSE` 也仍可恢复。支持用户停止、卸载取消、指数退避、服务端 `Retry-After`，以及重启提示的撤回与预算复位。
+## 稳定性原则
 
-## 要求
+- **只注册一个 Host 钩子**：`agent/request-error`。
+- 不注入 system prompt、续写提示、用户消息或 assistant 消息。
+- 不读写会话历史，不操作 inbox，不调用 `followup()`，不接管 Agent 生命周期。
+- 不修改 provider/model，不做应急路由或模型切换。
+- DSH 原生重试器优先；本插件只处理其未接管的可恢复错误。
+- 无运行时依赖，无需构建步骤。正常请求和成功回合完全不经过本插件。
 
-- DSH `>=0.2.1-rc.2 <0.3.0`（通过 `engines.dsh` 声明；超出范围的安装会跳过该 bundle 并给出警告，除非显式授予精确版本豁免）。
-- Node.js 20 或更新版本。
-- 这是 Host-only 插件：只贡献 Cordis loader 行，没有客户端 UI。
+## 要求与安装
 
-## 安装
-
-安装或升级到 `main` 最新 commit，只需一行：
-
-```sh
-dsh plugin --profile <profile> add "github:zzhaobh/dsh-server-error-continue#main"
-```
-
-再次执行同一命令即可升级：pnpm 会重新解析分支引用，lock 跟到 `main` 最新 commit。包是纯 JavaScript，没有构建步骤，也不需要 `prepare` 脚本或 pnpm 构建脚本授权。
-
-需要可复现时改为固定 commit：
+- DSH `>=0.2.1-rc.2 <0.3.0`。
+- Node.js 20.3.0 或更新版本（`AbortSignal.any()` 的最低版本）。
+- Host-only 插件，没有客户端 UI。
 
 ```sh
 dsh plugin --profile <profile> add "github:zzhaobh/dsh-server-error-continue#<commit>"
 ```
 
-本地开发时也可以直接链接 checkout：
+本地开发可链接 checkout：
 
 ```sh
 dsh plugin --profile <profile> add /path/to/dsh-server-error-continue
 ```
 
-启动前验证层，再启动：
+安装、升级或移除后重启 Host，确认运行中的实例已加载目标版本。
 
-```sh
-dsh --profile <profile> --dump-config | grep -A6 server-error-continue
-dsh --profile <profile>
-```
+## 从 2.x 迁移
 
-由 Electron 托管的 `desktop` profile 拒绝 CLI 的 boot/config-dump，请通过应用内插件管理器或直接编辑 profile 文件管理。
+3.0.0 删除以下高侵入能力：
 
-移除：`dsh plugin --profile <profile> remove @zzhaobh/dsh-server-error-continue` 会同时移除依赖和 bundle 层。
+- 回合重启及自动 `continue` 提示；
+- inbox/session/status/pre-step 监听；
+- `fallbackProvider` / `fallbackModel` 应急切换；
+- provider replay item-ID 不兼容时的自动换路由。
+
+`prompt`、`maxRestarts`、`fallbackProvider`、`fallbackModel` 仍可出现在旧配置中，但只会产生 `ignored legacy keys` 警告，不会执行任何行为。请从 profile 中移除它们。
+
+原生 provider `normal` 策略管理并耗尽的代码不再叠加第二份重试预算，也不会升级为回合重启。需要改变原生预算时，应调整该 provider 自己的 `retryPolicy`。
 
 ## 配置
 
-默认值在 bundle 自带的 [`cordis.patch.yml`](cordis.patch.yml) 中。用户可在 profile 自己的 `cordis.patch.yml` 覆盖该行；patch 会替换整个 `config` 值（不深合并），因此需要重述所有要保留的键。
+bundle 默认配置位于 [`cordis.patch.yml`](cordis.patch.yml)。覆盖 patch 中的 `config` 时会替换整个对象，需要重述所有要保留的键。
 
-| 字段 | 默认值 | 含义 |
-|---|---|---|
-| `delayMs` | `1000` | 同请求首次重试等待，之后按 2 倍增长 |
-| `maxDelayMs` | `30000` | 退避上限，必须不小于 `delayMs` |
-| `maxContinues` | `3` | **每个失败 step** 的额外同请求次数；`0` 表示无限（显式 opt-in），此时回合重启阶段不可达 |
-| `maxRestarts` | `2` | **每个失败链**的额外回合重启次数；`0` 关闭回合重启，退回同请求重试 |
-| `codes` | `["SERVER"]` | 额外可恢复错误码；终止码与永久文本排除仍然优先 |
-| `messageIncludes` | `["server_error", "upstream_error", "overloaded"]` | 包装码的额外大小写不敏感瞬态子串 |
-| `excludeIncludes` | `[]` | 站点特有永久子串；命中即否决文本兜底与内置 replay override |
-| `retryUnclassified` | `true` | 包装码未命中任何永久/瞬态文本时是否按瞬态处理；`false` 恢复严格白名单模式 |
-| `fallbackProvider` | 未设置 | 应急 provider 路由，仅在重试和回合重启都耗尽后使用；必须与 `fallbackModel` 同时设置 |
-| `fallbackModel` | 未设置 | 应急模型，例如 `deepseek-flash` |
-| `prompt` | `continue` | 兼容 v1 的旧配置，已弃用且不会发送；显式配置会记录警告 |
+| 字段 | bundle 默认 | 含义 |
+|---|---:|---|
+| `delayMs` | `1000` | 第一次额外重试的等待，之后按 2 倍增长；必须 ≥1 |
+| `maxDelayMs` | `30000` | 退避与可接受的 `Retry-After` 上限，必须 ≥`delayMs` |
+| `maxContinues` | `5` | 每个失败 step 的额外请求次数；代码内默认值是 `3`，bundle 显式设为 `5` |
+| `codes` | `["SERVER"]` | 额外允许恢复的错误码，永久错误排除仍优先 |
+| `messageIncludes` | `["server_error", "upstream_error", "overloaded"]` | 包装码的额外瞬态文本，大小写不敏感 |
+| `excludeIncludes` | `[]` | 永久文本排除，优先于瞬态覆盖规则 |
+| `retryUnclassified` | `true` | 未识别的 `PI_AI_ERROR`/`UNKNOWN` 包装错误是否按瞬态处理；`false` 使用严格白名单 |
 
-profile 覆盖示例：
+`maxContinues: 0` 是显式无限重试选项，仅在用户停止、Agent 替换或插件卸载时结束。默认保持有限，不建议无人值守任务使用无限模式。
 
-```yaml
-- id: server-error-continue
-  name: '@zzhaobh/dsh-server-error-continue'
-  config:
-    delayMs: 2000
-    maxDelayMs: 30000
-    maxContinues: 3
-    maxRestarts: 3
-    codes:
-      - SERVER
-    messageIncludes:
-      - server_error
-      - upstream_error
-      - overloaded
-    excludeIncludes: []
-    retryUnclassified: true
-    fallbackProvider: deepseek-account
-    fallbackModel: deepseek-flash
-```
+## 恢复顺序
 
-## 错误分类与恢复顺序
+1. **内容过滤直接终止**：不调用下游恢复器，因此原生 `always` 也不会绕过内容策略。
+2. 调用 `next()`，保留原生或其他恢复器的决定；下游异常原样传播。
+3. provider `always` 策略保持独占，本插件不介入。
+4. provider `normal` 策略管理的代码以其预算为准，本插件不补加次数。
+5. 永久事实优先：认证/权限、额度/计费、上下文超限、非法 schema/请求/参数、模型不存在或不支持、内容策略、非瞬态 4xx 不重试。
+6. 对未被原生策略接管的可恢复错误，执行同 step、同历史、同 provider/model 的重试。
+7. 等待期间响应用户取消和插件卸载；等待后确认原 Agent 仍注册，再返回 `{ kind: "retry" }`。
 
-1. **永久事实先排除**（优先于错误码、HTTP 状态和任何重试规则）：终止错误码、认证/权限、额度/计费/余额、上下文超限/413、非法 schema/请求/参数/API key、模型不存在/不支持/无可用通道、内容策略/安全过滤、适配器 `deferred response`/`ended pending`、`excludeIncludes`，以及非瞬态 4xx。408/425/429 例外。
-2. 命中 `codes`（默认 `SERVER`）或 HTTP 5xx → 可恢复。
-3. `PI_AI_ERROR`/`UNKNOWN` 包装码：先匹配 `messageIncludes` 与内置瞬态文本（英文 + 中文），都未命中时按 `retryUnclassified`（默认 `true`）视为瞬态。
-4. **网关伪 400 override**：加密 reasoning 无法验证/解密、`previous_response_id ... not found`、`上游流中途断开` / `TransferEncodingError` / `ConnectionResetError` / `Connection error.` / incomplete payload/chunked read 等传输中断文本先按瞬态处理（`excludeIncludes` 可否决），优先于 400/`INVALID_REQUEST` 的终止判断。`Response incomplete: content_filter` 等内容过滤截断仍保持终止。
-   此外，即使 provider 没有配置 retryPolicy，`SERVER`/`TIMEOUT`/`TRANSPORT`/`RATE_LIMIT`/`EMPTY_RESPONSE` 也直接视为可恢复码。
-5. 同请求重试在 `agent/request-error` waterfall 中后置，其他恢复器（包括 DSH 内置 provider retry）优先。
-6. provider `normal` 策略已管理并耗尽某码时，不再叠加同样的请求，直接进入回合重启阶段；provider `always` 策略保持独占，本插件不介入。
-7. 回合重启**不在失败回合内排队**：错误路径会让 driver 直接退出，回合内 followup 不会唤醒 agent。插件先记录 restart intent，等 agent 进入 idle 后再用 `agent.followup()` 排队 `source.kind: server-error-continue`（不是 `user`）的显式重启提示，从而真正唤醒新 turn、发新请求。
-8. **应急模型切换**：如果重启预算也耗尽，下一请求通过 `agent/request` waterfall 改写到 `fallbackProvider`/`fallbackModel`。请求头持久记录应急路由，后续请求无需每次强制改写；用户显式选择模型（`model/selection`）会立即结束应急状态。永久错误不会触发切换；两个字段都未配置时该功能关闭。
-9. **路由 replay 不兼容**：provider 拒收自己回放的历史 item ID（如 `Invalid 'input[85].id': 'item_...'. Expected an ID that begins with 'msg'`）时，同一条历史在同一路由上重试不可能成功，因此跳过重试/重启预算，立即切到应急路由并重试一次。
+插件只返回 DSH 原生恢复动作。真正的重新执行由 agent loop 完成，插件不会自行发起网络请求。
 
-## 内容过滤与工具错误的兼容
+## 覆盖的瞬态错误
 
-`Response incomplete: content_filter`、`CONTENT_FILTER`、`content_policy_violation` 按“跳过自动恢复”处理，不是网络瞬态错误：
+- 标准码：`SERVER`、`TIMEOUT`、`TRANSPORT`、`RATE_LIMIT`、`EMPTY_RESPONSE`。
+- HTTP 408、425、429 和 5xx。
+- `PI_AI_ERROR` / `UNKNOWN` 等包装码中的服务端、限流和断连文本。
+- 连接重置/拒绝/关闭、socket hang up、EOF、超时、broken pipe、网络不可达。
+- 上游流中途断开、`TransferEncodingError`、`ConnectionResetError`、incomplete chunked read、缺少 terminal response event。
+- 网关将加密 reasoning 验证/解密、`previous_response_id` 等临时路由亲和问题包装成 400 的已知情况。
 
-- 前置拦截其他重试处理器，清除旧的重启/切换意图，记录 `content_filter: skipping automatic recovery` 原因。
-- 不重试、不重启回合、不切换模型绕过过滤；即使同时出现连接断开或 replay item ID 文本也不恢复。
-- 保留原始失败，DSH 仍将该回合标为失败；不伪装成完成，不自动继续被过滤的任务。失败响应中的工具调用不会被 agent loop 执行。用户需检查任务，再提交允许的新任务。
-- `OpenAI Responses stream ended before a terminal response event` 则仍是可重试的断流文本，严格模式下也识别。
-- `invalid justification: expected a non-empty sentence` 属于文件工具参数校验，不是 LLM 断流；应修正工具参数，不重发模型请求来掩盖工具失败。
+`retryUnclassified: false` 可关闭未知包装文本的乐观兜底。`excludeIncludes` 可否决任何文本兜底和瞬态覆盖。
 
-安装/更新插件涉及依赖变更：先 `Cmd+Q` 完全退出桌面应用，运行安装指令后再打开，避免运行中 profile reload 的根 Include 问题。插件显示的安装版本不证明运行中的实例已重载。
+本插件不会为以下错误追加重试：认证、权限、额度、余额、上下文超限、非法请求/工具参数、模型不存在/不支持、内容过滤，以及普通 4xx；即使文本同时含有连接断开或加密 reasoning 覆盖词，明确终止码和永久事实仍优先。显式原生 `always`/`normal` 策略仍按各自配置拥有恢复权，内容过滤例外，始终被本插件 veto。provider 自己拒收历史 item-ID schema 时，本版本也不会换模型绕过。
 
-## 重启链的生命周期
+## 退避与取消
 
-- 计数绑定 Agent 上的失败链：成功回合（`turn/end` 原因不是 `error`）、真实用户输入、插件卸载都会结束链并归零。
-- 真实用户消息或其他自动生产者（goal round、schedule、job 唤醒等）插入 inbox 时，排队中的重启提示会被撤回并让位。
-- 用户停止会清空 inbox；取消信号置位后不再排队重启。
-- 已有 pending 用户消息或 goal round 时让位；待处理的自动通知（subagent 结果、schedule 提醒等）不再阻止重启，会与新回合一起被消费。
-- 应急路由独立于重启链：成功回合不会清除它，只有用户显式选择模型、Agent 销毁或插件卸载才会退出；切换后会话中会追加一条 `model-selection` 通知，说明原路由与应急路由。
-- 卸载/重载会撤回未 claim 的重启提示并等待在途恢复结束；`agent/pre-step` 校验预约，失效则 reject。
-- 排队后被撤回或 discarded 的重启退还预算槽位；已 claim 后因校验失败被拒的不退。
+- 退避从 `delayMs` 开始，每次翻倍，最高 `maxDelayMs`。
+- 合法 `Retry-After` 不会被本地退避缩短；超过 `maxDelayMs` 时保持失败，不进行超长等待。
+- 用户停止会传播原始 `AbortError`；插件卸载会中止并等待所有在途恢复结束。
+- 重试预算只存在当前进程内，按 Agent + turn + step + signal 隔离，不持久化、不读取 session。
 
 ## 验证与边界
 
-- 单测：`node --test test/plugin.test.mjs`；当前 66 PASS，完整记录与证据边界见 [VERIFICATION.md](VERIFICATION.md)。
-- CI 在 Node 20/22/24 上运行 `node --check` 与完整测试。
-- 只处理“流内 finish error”；流开始前抛出的异常，以及不经过 agent loop 的直连 LLM 调用（会话标题、压缩摘要等）不在覆盖范围内。
-- “未分类即瞬态”是有界但偏乐观的策略：未知永久错误可能先消耗 `maxContinues` 次重试和最多 `maxRestarts` 次重启才终止；可用 `retryUnclassified: false` 或 `excludeIncludes` 收紧。
-- 重启提示会作为会话消息进入历史（与 goal round 机制相同），但不冒充用户发言。
-- 恢复预算只存在于当前进程与失败链上，不跨插件重载或 DSH 重启持久化。
-- 应急切换只改路由，不能让失效凭证变有效：`deepseek-account` 必须已登录（或换用其他已配置 provider）；跨 provider 切换会把 provider 私有 replay 状态降级为通用历史。
-- item ID 拒收属于 provider/adapter 的回放兼容问题，不是本插件能修复的存储历史；应急切换只是绕过该路由，应急路由必须能接受这条外来历史才有效。
-- 不对所有 provider/网关错误类声明真实端到端验证；详见 [VERIFICATION.md](VERIFICATION.md)。
+```sh
+npm test
+npm pack --dry-run
+```
+
+真实 Cordis 挂载验证脚本为 `test/cordis-mount.mjs`。在本机 DSH 安装上通过 Electron 运行，不发出模型请求：
+
+```sh
+ELECTRON_RUN_AS_NODE=1 \
+DSH_CORDIS_ENTRY="/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/cordis/lib/index.js" \
+"/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness" test/cordis-mount.mjs
+```
+
+当前证据和精确结果见 [VERIFICATION.md](VERIFICATION.md)。
+
+边界：
+
+- 仅覆盖 agent loop 的流内模型请求失败；`ctx.llm.stream()` 直连、标题/摘要等独立调用不在范围内。
+- 不保证每个 provider 的真实故障都能恢复，也不保证服务会在有限预算内恢复。
+- 单元和 Cordis 测试证明分类、动作、取消和 API 表面，不替代各 provider 的真实断网端到端演练。
 
 ## 开发
 
 ```sh
 node --check index.js
-node --test test/plugin.test.mjs
+node --test --test-timeout=10000 test/plugin.test.mjs
 ```
 
-无运行时依赖。插件入口导出 `apply(ctx, config)`，bundle loader 行在 `cordis.patch.yml` 中声明。
+插件入口导出 `apply(ctx, config)`；bundle 只包含 [`cordis.patch.yml`](cordis.patch.yml) 中的一条 loader 记录。
 
 ## 许可证
 
